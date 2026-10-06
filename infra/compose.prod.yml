@@ -1,0 +1,29 @@
+# Локально из корня репозитория:
+# docker compose -p maxnewsbot -f infra/compose.prod.yml up -d --build
+# (имена контейнеров совпадают с VPS, см. infra/compose.prod.vps.yml).
+
+services:
+  maxnewsbot:
+    image: eshim88/content-fabric-max-newsbot:latest
+    build:
+      context: ..
+      dockerfile: max_news_bot/Dockerfile
+    container_name: maxnewsbot
+    env_file:
+      - ../max_news_bot/.env
+    environment:
+      DATABASE_PATH: /app/data/max_news_bot.db
+    volumes:
+      - ../max_news_bot/data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "/app/max_news_bot/scripts/healthcheck.py"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - maxnewsbot-net
+
+networks:
+  maxnewsbot-net:
+    driver: bridge

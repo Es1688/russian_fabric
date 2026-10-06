@@ -1,0 +1,233 @@
+name: Build, Push and Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build_and_push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      image_tag: ${{ steps.vars.outputs.tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Login DockerHub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Set image metadata
+        id: vars
+        run: |
+          TAG="$(git rev-parse --short HEAD)"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Build image
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          IMAGE_REPOSITORY: ${{ vars.DOCKER_IMAGE_REPOSITORY }}
+        run: |
+          REPO="${IMAGE_REPOSITORY:-content-fabric-max-newsbot}"
+          IMAGE_NAME="${DOCKER_USERNAME}/${REPO}"
+          docker build \
+            -f max_news_bot/Dockerfile \
+            -t "${IMAGE_NAME}:latest" \
+            -t "${IMAGE_NAME}:${{ steps.vars.outputs.tag }}" \
+            .
+
+      - name: Push image
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          IMAGE_REPOSITORY: ${{ vars.DOCKER_IMAGE_REPOSITORY }}
+        run: |
+          REPO="${IMAGE_REPOSITORY:-content-fabric-max-newsbot}"
+          IMAGE_NAME="${DOCKER_USERNAME}/${REPO}"
+          docker push "${IMAGE_NAME}:latest"
+          docker push "${IMAGE_NAME}:${{ steps.vars.outputs.tag }}"
+
+  deploy_to_vps:
+    runs-on: ubuntu-latest
+    needs: build_and_push
+    if: github.ref == 'refs/heads/main'
+    timeout-minutes: 25
+
+    steps:
+      - name: Validate build outputs
+        env:
+          IMAGE_TAG: ${{ needs.build_and_push.outputs.image_tag }}
+        run: |
+          if [ -z "${IMAGE_TAG}" ]; then
+            echo "build_and_push did not provide image_tag output"
+            exit 1
+          fi
+
+      - name: Validate required VPS secrets
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+        run: |
+          if [ -z "${VPS_HOST}" ]; then
+            echo "Set VPS_HOST secret"
+            exit 1
+          fi
+          if [ -z "${VPS_USER}" ]; then
+            echo "Set VPS_USER secret"
+            exit 1
+          fi
+          if [ -z "${VPS_SSH_KEY}" ]; then
+            echo "Set VPS_SSH_KEY secret"
+            exit 1
+          fi
+          if [ -z "${DOCKER_USERNAME}" ]; then
+            echo "Set DOCKER_USERNAME secret"
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Render VPS compose
+        id: vps_compose
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          IMAGE_REPOSITORY: ${{ vars.DOCKER_IMAGE_REPOSITORY }}
+          IMAGE_TAG: ${{ needs.build_and_push.outputs.image_tag }}
+          VPS_APP_DIR: ${{ vars.VPS_APP_DIR }}
+        run: |
+          set -euo pipefail
+          REPO="${IMAGE_REPOSITORY:-content-fabric-max-newsbot}"
+          IMAGE_NAME="${DOCKER_USERNAME}/${REPO}"
+          IMAGE_TAG_CLEAN="$(echo "${IMAGE_TAG:-}" | tr -d '\r' | xargs)"
+          IMAGE_TAG_CLEAN="${IMAGE_TAG_CLEAN:-latest}"
+          IMAGE="${IMAGE_NAME}:${IMAGE_TAG_CLEAN}"
+          APP_DIR="${VPS_APP_DIR:-/opt/maxnewsbot}"
+          mkdir -p .deploy
+          VALIDATE_DIR="$(pwd)/.deploy/_validate"
+          mkdir -p "${VALIDATE_DIR}/data"
+          touch "${VALIDATE_DIR}/.env"
+          sed -e "s|__BOT_IMAGE__|${IMAGE}|g" -e "s|__APP_DIR__|${VALIDATE_DIR}|g" \
+            infra/compose.prod.vps.yml > .deploy/_validate-compose.yml
+          docker compose -f .deploy/_validate-compose.yml config >/dev/null
+          rm -f .deploy/_validate-compose.yml
+          sed -e "s|__BOT_IMAGE__|${IMAGE}|g" -e "s|__APP_DIR__|${APP_DIR}|g" \
+            infra/compose.prod.vps.yml > .deploy/compose.prod.yml
+          COMPOSE_B64="$(base64 -w0 .deploy/compose.prod.yml)"
+          echo "app_dir=${APP_DIR}" >> "${GITHUB_OUTPUT}"
+          echo "compose_b64=${COMPOSE_B64}" >> "${GITHUB_OUTPUT}"
+          echo "Rendered compose for ${IMAGE} -> ${APP_DIR}"
+
+      - name: Prepare VPS application directory
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || '22' }}
+          script_stop: true
+          script: |
+            set -euo pipefail
+            APP_DIR="${{ steps.vps_compose.outputs.app_dir }}"
+            mkdir -p "${APP_DIR}/data" || {
+              echo "Cannot create ${APP_DIR}. Set writable VPS_APP_DIR variable or fix permissions."
+              exit 1
+            }
+            if [ ! -f "${APP_DIR}/.env" ]; then
+              echo "Missing ${APP_DIR}/.env on VPS"
+              exit 1
+            fi
+            docker run --rm -v "${APP_DIR}/data:/data" alpine chown -R 10001:10001 /data
+
+      - name: Deploy to VPS over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          IMAGE_REPOSITORY: ${{ vars.DOCKER_IMAGE_REPOSITORY }}
+          IMAGE_TAG: ${{ needs.build_and_push.outputs.image_tag }}
+          COMPOSE_B64: ${{ steps.vps_compose.outputs.compose_b64 }}
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || '22' }}
+          script_stop: true
+          envs: DOCKER_USERNAME,IMAGE_REPOSITORY,IMAGE_TAG,COMPOSE_B64
+          script: |
+            set -euo pipefail
+
+            APP_DIR="${{ steps.vps_compose.outputs.app_dir }}"
+            REPO="${IMAGE_REPOSITORY:-content-fabric-max-newsbot}"
+            IMAGE_NAME="${DOCKER_USERNAME}/${REPO}"
+            IMAGE_NAME_CLEAN="$(echo "${IMAGE_NAME:-}" | tr -d '\r' | xargs)"
+            IMAGE_TAG_CLEAN="$(echo "${IMAGE_TAG:-}" | tr -d '\r' | xargs)"
+            IMAGE_TAG_CLEAN="${IMAGE_TAG_CLEAN:-latest}"
+
+            if [ -z "${IMAGE_NAME_CLEAN}" ]; then
+              echo "IMAGE_NAME is empty. Check build job outputs."
+              exit 1
+            fi
+            if [ -z "${COMPOSE_B64:-}" ]; then
+              echo "COMPOSE_B64 is empty. Check render step output."
+              exit 1
+            fi
+
+            IMAGE="${IMAGE_NAME_CLEAN}:${IMAGE_TAG_CLEAN}"
+            COMPOSE_FILE="${APP_DIR}/compose.prod.yml"
+            echo "Deploying image ${IMAGE}"
+
+            if docker compose version >/dev/null 2>&1; then
+              COMPOSE_CMD="docker compose"
+            elif command -v docker-compose >/dev/null 2>&1; then
+              COMPOSE_CMD="docker-compose"
+            else
+              echo "Docker Compose is not installed on VPS"
+              exit 1
+            fi
+
+            echo "${COMPOSE_B64}" | base64 -d > "${COMPOSE_FILE}"
+            if grep -q '__APP_DIR__\|__BOT_IMAGE__' "${COMPOSE_FILE}"; then
+              echo "Compose file still contains unresolved placeholders"
+              sed -n '1,40p' "${COMPOSE_FILE}"
+              exit 1
+            fi
+
+            docker pull "${IMAGE}"
+
+            if ! ${COMPOSE_CMD} -p maxnewsbot -f "${COMPOSE_FILE}" config; then
+              echo "Invalid compose file: ${COMPOSE_FILE}"
+              sed -n '1,40p' "${COMPOSE_FILE}"
+              exit 1
+            fi
+
+            ${COMPOSE_CMD} -p maxnewsbot -f "${COMPOSE_FILE}" up -d --remove-orphans
+
+            bot_ready=""
+            for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+              if docker exec maxnewsbot true >/dev/null 2>&1; then
+                bot_ready=1
+                break
+              fi
+              sleep 2
+            done
+            if [ -z "${bot_ready}" ]; then
+              echo "Timeout waiting for maxnewsbot container"
+              docker ps -a
+              docker logs maxnewsbot --tail 50 2>&1 || true
+              exit 1
+            fi
+
+            docker ps --filter "name=maxnewsbot" --format "table {{.Names}}\t{{.Image}}\t{{.Status}}"

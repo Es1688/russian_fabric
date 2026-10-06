@@ -1,0 +1,17 @@
+# Effective for the documented build: docker build -f max_news_bot/Dockerfile .
+# (Docker reads .dockerignore from the build context root; max_news_bot/.dockerignore
+# mirrors these patterns for package-dir builds.)
+.venv/
+venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+**/*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.deploy/
+.env
+max_news_bot/.env
+data/*.db*
+max_news_bot/data/*.db*

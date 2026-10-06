@@ -1,0 +1,14 @@
+# Patterns cover both build context choices: repo root
+# (docker build -f max_news_bot/Dockerfile .) and the package dir.
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+**/*.pyc
+.pytest_cache/
+data/*.db
+max_news_bot/data/*.db
+data/*.db*
+max_news_bot/data/*.db*
+.env
+max_news_bot/.env

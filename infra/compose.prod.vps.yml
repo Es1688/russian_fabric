@@ -1,0 +1,24 @@
+# Шаблон для VPS: подстановки __BOT_IMAGE__ и __APP_DIR__ (см. .github/workflows/docker.yml).
+
+services:
+  maxnewsbot:
+    image: __BOT_IMAGE__
+    container_name: maxnewsbot
+    restart: unless-stopped
+    env_file:
+      - __APP_DIR__/.env
+    environment:
+      DATABASE_PATH: /app/data/max_news_bot.db
+    volumes:
+      - __APP_DIR__/data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "/app/max_news_bot/scripts/healthcheck.py"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - maxnewsbot-net
+
+networks:
+  maxnewsbot-net:
+    driver: bridge

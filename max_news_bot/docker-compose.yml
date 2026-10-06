@@ -1,0 +1,16 @@
+services:
+  maxnewsbot:
+    build:
+      context: ..
+      dockerfile: max_news_bot/Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_PATH: /app/data/max_news_bot.db
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "/app/max_news_bot/scripts/healthcheck.py"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
