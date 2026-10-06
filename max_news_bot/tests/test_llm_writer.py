@@ -167,16 +167,9 @@ async def test_request_format_article_delimiters_and_auth(llm_server) -> None:
     assert item.title in user_content
 
 
-async def test_disable_reasoning_adds_openrouter_switch(llm_server) -> None:
-    server, base_url = llm_server
-
-    await make_writer(base_url, disable_reasoning=True).write_post(make_item())
-
-    body = server.requests[0]["json"]
-    assert body["reasoning"] == {"enabled": False}
-
-
-async def test_reasoning_switch_absent_without_flag(llm_server) -> None:
+async def test_reasoning_switch_absent_from_payload(llm_server) -> None:
+    # the legacy reasoning.enabled=false switch was dropped in the migration
+    # to Yandex AI Studio; the payload must stay a plain chat completion
     server, base_url = llm_server
 
     await make_writer(base_url).write_post(make_item())
@@ -280,7 +273,8 @@ async def test_null_content_is_infra_not_written(llm_server) -> None:
 
 
 async def test_content_parts_list_is_joined_into_text(llm_server) -> None:
-    # OpenRouter/Qwen shape: content is a list of typed parts, not a string
+    # some OpenAI-compatible providers return content as a list of typed
+    # parts instead of a plain string
     server, base_url = llm_server
     server.content = [
         {"type": "text", "text": "Первая часть поста. "},

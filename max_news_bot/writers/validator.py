@@ -3,8 +3,8 @@ from __future__ import annotations
 import html
 import re
 
-# Telegram counts the rendered message, so tags are not part of the limit.
-_HARD_MAX_CHARS = 4096
+# MAX counts the rendered message, so tags are not part of the limit.
+_HARD_MAX_CHARS = 4000
 
 # Tag-like sequences only: "<b>", "</a>", "<a href=...>"; "< 3" stays text.
 _TAG_RE = re.compile(r"</?[a-zA-Z][^>]*>")
@@ -15,7 +15,7 @@ _URL_RE = re.compile(r"https?://|www\.", re.IGNORECASE)
 _ANCHOR_RE = re.compile(r"<a\s", re.IGNORECASE)
 _MARKDOWN_LINK_RE = re.compile(r"\]\(\s*\S", re.IGNORECASE)
 
-# Bare domains ("evil.example.com", "хабр.ру"): Telegram autolinks them, so a
+# Bare domains ("evil.example.com", "хабр.ру"): messengers autolink them, so a
 # domain without a scheme is as clickable as a full URL. Curated TLD list
 # (incl. Cyrillic zones and common lookalikes) keeps false positives low;
 # ambiguous rejects are audited via rejected_text during dry-run.
@@ -56,7 +56,7 @@ def validate_post_text(
     - no links (URL, bare domain, ``<a href``, markdown link) — links are
       code-added;
     - no refusal phrases ("As an AI…");
-    - hard limit 4096 chars (Telegram), soft limit ``max_chars``,
+    - hard limit 4000 chars (MAX), soft limit ``max_chars``,
       minimum ``min_chars``.
     """
     if (

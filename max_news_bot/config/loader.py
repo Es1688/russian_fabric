@@ -39,10 +39,6 @@ class LlmConfig:
     max_tokens: int
     temperature: float
     api_key: str  # env-only secret, never in yaml
-    proxy: str = ""  # env-only LLM_PROXY (socks5://… or http://…), empty = direct
-    # thinking models (qwen3 & co) can burn the whole max_tokens budget on
-    # reasoning and return content=null; this sends reasoning.enabled=false
-    disable_reasoning: bool = False
 
 
 @dataclass(frozen=True)
@@ -70,7 +66,7 @@ class FactoryConfig:
 @dataclass(frozen=True)
 class AppConfig:
     bot_token: str
-    channel_id: str
+    channel_id: int  # MAX chat_id is int64
     admin_ids: list[int]
     log_level: str
     settings: AppSettings
@@ -104,7 +100,7 @@ def _env_str(name: str, default: str) -> str:
 # Fallback prompt when the yaml section lacks one; sources.yaml carries the
 # real editor prompt (kept in sync with max_news_bot/writers/llm.py DEFAULT_PROMPT).
 _DEFAULT_FACTORY_PROMPT = """\
-Ты — редактор Telegram-канала об IT и технологиях. По новости, переданной
+Ты — редактор канала об IT и технологиях. По новости, переданной
 пользователем внутри тегов <article>…</article>, ты пишешь один пост для канала.
 
 Правила:
@@ -154,16 +150,26 @@ def _parse_factory(raw: dict[str, Any]) -> FactoryConfig:
         include_keywords=[str(x) for x in raw.get("include_keywords", [])],
         exclude_keywords=[str(x) for x in raw.get("exclude_keywords", [])],
         llm=LlmConfig(
+            # Yandex AI Studio OpenAI-compatible endpoint; models are full
+            # URIs gpt://<folder_id>/<model>. FOLDER_ID in the default is a
+            # placeholder — set the real Yandex Cloud folder id in
+            # sources.yaml or via the LLM_MODEL env var.
             base_url=_env_str(
-                "LLM_BASE_URL", str(llm_raw.get("base_url", "https://api.openai.com/v1"))
+                "LLM_BASE_URL",
+                str(
+                    llm_raw.get(
+                        "base_url", "https://ai.api.cloud.yandex.net/v1"
+                    )
+                ),
             ),
-            model=_env_str("LLM_MODEL", str(llm_raw.get("model", "gpt-4o-mini"))),
+            model=_env_str(
+                "LLM_MODEL",
+                str(llm_raw.get("model", "gpt://FOLDER_ID/yandexgpt-5-lite")),
+            ),
             timeout=int(llm_raw.get("timeout", 60)),
             max_tokens=int(llm_raw.get("max_tokens", 800)),
             temperature=float(llm_raw.get("temperature", 0.7)),
             api_key=api_key,
-            proxy=os.getenv("LLM_PROXY", "").strip(),
-            disable_reasoning=bool(llm_raw.get("disable_reasoning", False)),
         ),
         prompt=str(raw.get("prompt") or _DEFAULT_FACTORY_PROMPT),
     )
@@ -212,13 +218,20 @@ def load_config() -> AppConfig:
         exclude_keywords=[str(x) for x in filters.get("exclude_keywords", [])],
     )
 
-    bot_token = os.getenv("BOT_TOKEN", "").strip()
-    channel_id = os.getenv("CHANNEL_ID", "").strip()
+    bot_token = os.getenv("MAX_BOT_TOKEN", "").strip()
+    channel_id_raw = os.getenv("MAX_CHANNEL_ID", "").strip()
     admin_raw = os.getenv("ADMIN_IDS", "").strip()
     log_level = os.getenv("LOG_LEVEL", "INFO").strip()
 
-    if not bot_token or not channel_id:
-        raise ValueError("BOT_TOKEN and CHANNEL_ID are required")
+    if not bot_token or not channel_id_raw:
+        raise ValueError("MAX_BOT_TOKEN and MAX_CHANNEL_ID are required")
+
+    try:
+        channel_id = int(channel_id_raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"MAX_CHANNEL_ID must be an integer chat id, got: {channel_id_raw!r}"
+        ) from exc
 
     if factory.enabled and not factory.llm.api_key:
         raise ValueError("LLM_API_KEY is required when factory is enabled")

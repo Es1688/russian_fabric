@@ -26,7 +26,7 @@ SKIP_MARKER = "SKIP"
 
 # Default system prompt (ru); the configured prompt from sources.yaml wins.
 DEFAULT_PROMPT = """\
-Ты — редактор Telegram-канала об IT и технологиях. По новости, переданной
+Ты — редактор канала об IT и технологиях. По новости, переданной
 пользователем внутри тегов <article>…</article>, ты пишешь один пост для канала.
 
 Правила:
@@ -52,7 +52,8 @@ def _truncate(text: str) -> str:
 
 
 class LlmWriter:
-    """Writes posts via an OpenAI-compatible /chat/completions endpoint."""
+    """Writes posts via an OpenAI-compatible /chat/completions endpoint
+    (Yandex AI Studio: https://ai.api.cloud.yandex.net/v1)."""
 
     def __init__(
         self,
@@ -64,7 +65,6 @@ class LlmWriter:
         temperature: float,
         prompt: str,
         session: aiohttp.ClientSession | None = None,
-        disable_reasoning: bool = False,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
@@ -75,7 +75,6 @@ class LlmWriter:
         self._prompt = prompt
         # Shared process-wide session wins; otherwise one per call.
         self._session = session
-        self._disable_reasoning = disable_reasoning
         self._prompt_version = hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:8]
 
     async def write_post(self, item: NewsItem) -> WriteResult:
@@ -159,10 +158,6 @@ class LlmWriter:
             "max_tokens": self._max_tokens,
             "temperature": self._temperature,
         }
-        if self._disable_reasoning:
-            # OpenRouter switch: thinking models otherwise spend the whole
-            # max_tokens budget on reasoning and return content=null
-            payload["reasoning"] = {"enabled": False}
         headers = {
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
@@ -227,9 +222,9 @@ class _BadResponseError(Exception):
 
 def _normalize_content(raw: Any) -> str | None:
     """Accept both shapes allowed by the OpenAI chat spec: a plain string
-    or a list of content parts. Some providers (e.g. OpenRouter with Qwen
-    models) return text parts; non-text parts are dropped. Returns None for
-    anything else (null included) so the caller can reject it."""
+    or a list of content parts. Some OpenAI-compatible providers return
+    text parts; non-text parts are dropped. Returns None for anything else
+    (null included) so the caller can reject it."""
     if isinstance(raw, str):
         return raw
     if isinstance(raw, list):

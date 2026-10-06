@@ -9,8 +9,8 @@ from max_news_bot.config.loader import load_config
 def env_vars(monkeypatch: pytest.MonkeyPatch) -> None:
     # hermetic: a developer's real max_news_bot/.env must not leak into defaults
     monkeypatch.setattr("max_news_bot.config.loader.load_dotenv", lambda: None)
-    monkeypatch.setenv("BOT_TOKEN", "123456789:test-token")
-    monkeypatch.setenv("CHANNEL_ID", "-1001234567890")
+    monkeypatch.setenv("MAX_BOT_TOKEN", "123456789:test-token")
+    monkeypatch.setenv("MAX_CHANNEL_ID", "-1001234567890")
     monkeypatch.setenv("ADMIN_IDS", "111,222,333")
     monkeypatch.setenv("LOG_LEVEL", "DEBUG")
     monkeypatch.delenv("POST_INTERVAL_HOURS", raising=False)
@@ -23,12 +23,15 @@ def env_vars(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("FACTORY_INTERVAL_HOURS", raising=False)
     monkeypatch.delenv("LLM_BASE_URL", raising=False)
     monkeypatch.delenv("LLM_MODEL", raising=False)
-    monkeypatch.delenv("LLM_PROXY", raising=False)
 
 
 def test_load_config_reads_yaml(env_vars: None) -> None:
     config = load_config()
 
+    assert config.bot_token == "123456789:test-token"
+    # MAX chat_id is int64: parsed as int, not kept as a string
+    assert config.channel_id == -1001234567890
+    assert isinstance(config.channel_id, int)
     assert config.settings.max_news_per_source == 5
     assert config.filters.include_keywords == []
     assert config.filters.exclude_keywords == []
@@ -63,18 +66,27 @@ def test_env_overrides_yaml(env_vars: None, monkeypatch: pytest.MonkeyPatch) -> 
 
 
 def test_missing_bot_token_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("BOT_TOKEN", "")
-    monkeypatch.setenv("CHANNEL_ID", "-1001234567890")
+    monkeypatch.setenv("MAX_BOT_TOKEN", "")
+    monkeypatch.setenv("MAX_CHANNEL_ID", "-1001234567890")
 
-    with pytest.raises(ValueError, match="BOT_TOKEN and CHANNEL_ID are required"):
+    with pytest.raises(ValueError, match="MAX_BOT_TOKEN and MAX_CHANNEL_ID are required"):
         load_config()
 
 
 def test_missing_channel_id_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("BOT_TOKEN", "123456789:test-token")
-    monkeypatch.setenv("CHANNEL_ID", "")
+    monkeypatch.setenv("MAX_BOT_TOKEN", "123456789:test-token")
+    monkeypatch.setenv("MAX_CHANNEL_ID", "")
 
-    with pytest.raises(ValueError, match="BOT_TOKEN and CHANNEL_ID are required"):
+    with pytest.raises(ValueError, match="MAX_BOT_TOKEN and MAX_CHANNEL_ID are required"):
+        load_config()
+
+
+def test_invalid_channel_id_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("max_news_bot.config.loader.load_dotenv", lambda: None)
+    monkeypatch.setenv("MAX_BOT_TOKEN", "123456789:test-token")
+    monkeypatch.setenv("MAX_CHANNEL_ID", "not-a-number")
+
+    with pytest.raises(ValueError, match="MAX_CHANNEL_ID"):
         load_config()
 
 
@@ -95,8 +107,8 @@ def test_admin_ids_ignores_invalid_tokens(
 
 
 def test_empty_sources_yaml(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("BOT_TOKEN", "123456789:test-token")
-    monkeypatch.setenv("CHANNEL_ID", "-1001234567890")
+    monkeypatch.setenv("MAX_BOT_TOKEN", "123456789:test-token")
+    monkeypatch.setenv("MAX_CHANNEL_ID", "-1001234567890")
     monkeypatch.setattr(
         "max_news_bot.config.loader.yaml.safe_load",
         lambda _content: {"settings": {}, "filters": {}, "sources": []},
@@ -149,15 +161,14 @@ def test_factory_defaults_from_yaml(env_vars: None) -> None:
     assert factory.include_keywords == []
     assert factory.exclude_keywords == []
     # llm.base_url/model name the provider and legitimately change per
-    # deployment (yaml or env); only their shape is part of the contract
-    assert factory.llm.base_url.startswith("https://")
-    assert factory.llm.model
+    # deployment (yaml or env); the shipped defaults target Yandex AI Studio
+    # (FOLDER_ID placeholder must be replaced with the real folder id)
+    assert factory.llm.base_url == "https://ai.api.cloud.yandex.net/v1"
+    assert factory.llm.model == "gpt://FOLDER_ID/yandexgpt-5-lite"
     assert factory.llm.timeout == 60
     assert factory.llm.max_tokens == 800
     assert factory.llm.temperature == 0.7
     assert factory.llm.api_key == "test-llm-key"  # env-only, never from yaml
-    assert factory.llm.proxy == ""  # direct LLM traffic unless LLM_PROXY is set
-    assert factory.llm.disable_reasoning is True  # qwen3 thinking-model guard
     assert "SKIP" in factory.prompt
     assert "<article>" in factory.prompt
 
@@ -169,7 +180,6 @@ def test_factory_env_overrides_yaml(
     monkeypatch.setenv("FACTORY_INTERVAL_HOURS", "6")
     monkeypatch.setenv("LLM_BASE_URL", "http://localhost:8080/v1")
     monkeypatch.setenv("LLM_MODEL", "custom-model")
-    monkeypatch.setenv("LLM_PROXY", "socks5://127.0.0.1:10808")
 
     config = load_config()
 
@@ -177,7 +187,6 @@ def test_factory_env_overrides_yaml(
     assert config.factory.interval_hours == 6
     assert config.factory.llm.base_url == "http://localhost:8080/v1"
     assert config.factory.llm.model == "custom-model"
-    assert config.factory.llm.proxy == "socks5://127.0.0.1:10808"
 
 
 def test_factory_dry_run_env_overrides_yaml(
@@ -192,13 +201,14 @@ def test_factory_dry_run_env_overrides_yaml(
     assert config.factory.dry_run is False
 
 
-def test_factory_llm_disable_reasoning_defaults_off(monkeypatch) -> None:
+def test_factory_llm_defaults_to_yandex(monkeypatch) -> None:
     from max_news_bot.config.loader import _parse_factory
 
     monkeypatch.setenv("LLM_API_KEY", "test-llm-key")
     config = _parse_factory({})
 
-    assert config.llm.disable_reasoning is False
+    assert config.llm.base_url == "https://ai.api.cloud.yandex.net/v1"
+    assert config.llm.model == "gpt://FOLDER_ID/yandexgpt-5-lite"
 
 
 def test_factory_enabled_without_api_key_raises(

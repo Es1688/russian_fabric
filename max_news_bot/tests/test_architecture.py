@@ -45,9 +45,9 @@ def test_models_define_news_item_and_publisher_result() -> None:
 
 
 def test_missing_bot_token_fail_fast_on_startup(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("BOT_TOKEN", raising=False)
-    monkeypatch.setenv("BOT_TOKEN", "")
-    monkeypatch.setenv("CHANNEL_ID", "-1001234567890")
+    monkeypatch.delenv("MAX_BOT_TOKEN", raising=False)
+    monkeypatch.setenv("MAX_BOT_TOKEN", "")
+    monkeypatch.setenv("MAX_CHANNEL_ID", "-1001234567890")
 
-    with pytest.raises(ValueError, match="BOT_TOKEN and CHANNEL_ID are required"):
+    with pytest.raises(ValueError, match="MAX_BOT_TOKEN and MAX_CHANNEL_ID are required"):
         load_config()

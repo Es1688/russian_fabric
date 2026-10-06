@@ -44,16 +44,16 @@ factory:
   include_keywords: []
   exclude_keywords: []
   llm:
-    base_url: "https://openrouter.ai/api/v1"
-    model: "qwen/qwen3.8-flash"
+    base_url: "https://ai.api.cloud.yandex.net/v1"
+    # Yandex AI Studio: модель — полный URI gpt://<folder_id>/<model>.
+    # FOLDER_ID — заглушка: заменить на реальный id каталога Yandex Cloud
+    # (или задать модель целиком через переменную окружения LLM_MODEL).
+    model: "gpt://FOLDER_ID/yandexgpt-5-lite"
     timeout: 60
     max_tokens: 800
     temperature: 0.7
-    # qwen3 — думающая модель: без отключения reasoning она расходует весь
-    # max_tokens на «размышления» и возвращает content=null (пустой ответ)
-    disable_reasoning: true
   prompt: |
-    Ты — редактор Telegram-канала об IT и технологиях. По новости, переданной
+    Ты — редактор канала об IT и технологиях. По новости, переданной
     пользователем внутри тегов <article>…</article>, ты пишешь один пост для канала.
 
     Правила:

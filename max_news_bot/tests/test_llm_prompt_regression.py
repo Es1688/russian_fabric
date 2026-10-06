@@ -39,9 +39,9 @@ _ITEM = NewsItem(
 
 async def test_real_llm_output_passes_validator() -> None:
     writer = LlmWriter(
-        base_url=os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"),
+        base_url=os.getenv("LLM_BASE_URL", "https://ai.api.cloud.yandex.net/v1"),
         api_key=os.environ["LLM_API_KEY"],
-        model=os.getenv("LLM_MODEL", "gpt-4o-mini"),
+        model=os.getenv("LLM_MODEL", "gpt://FOLDER_ID/yandexgpt-5-lite"),
         timeout=90,
         max_tokens=800,
         temperature=0.7,

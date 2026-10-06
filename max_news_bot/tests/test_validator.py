@@ -42,7 +42,7 @@ def test_tags_do_not_count_towards_length() -> None:
         'Смотри <a href="https://example.com">тут</a>',
         "Маркдаун-ссылка [тут](https://example.com)",
         "БЕЗ ПРОТОКОЛА HTTP://EXAMPLE.COM",
-        # bare domains: Telegram autolinks them even without a scheme
+        # bare domains: messengers autolink them even without a scheme
         "Беz схемы evil.example.com/page",
         "Кириллический домен хабр.ру",
         "BBCode [url]evil.example.com[/url]",
@@ -113,14 +113,14 @@ def test_soft_limit_boundary() -> None:
     assert reason is not None and "too long" in reason
 
 
-def test_hard_limit_4096_beats_max_chars() -> None:
-    # max_chars above the hard limit still rejects 4097 visible chars
+def test_hard_limit_4000_beats_max_chars() -> None:
+    # max_chars above the hard limit still rejects 4001 visible chars
     ok, reason = validate_post_text(
-        _visible(4097), max_chars=5000, min_chars=MIN_CHARS
+        _visible(4001), max_chars=5000, min_chars=MIN_CHARS
     )
     assert ok is False
     assert reason is not None and "hard" in reason
-    ok, _ = validate_post_text(_visible(4096), max_chars=5000, min_chars=MIN_CHARS)
+    ok, _ = validate_post_text(_visible(4000), max_chars=5000, min_chars=MIN_CHARS)
     assert ok is True
 
 

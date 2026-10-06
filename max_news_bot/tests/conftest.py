@@ -99,7 +99,7 @@ def factory_config() -> FactoryConfig:
 def app_config(tmp_path: Path, factory_config: FactoryConfig) -> AppConfig:
     return AppConfig(
         bot_token="123456789:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-        channel_id="-1001234567890",
+        channel_id=-1001234567890,
         admin_ids=[111, 222],
         log_level="INFO",
         settings=AppSettings(
