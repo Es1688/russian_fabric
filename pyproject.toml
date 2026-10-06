@@ -1,0 +1,27 @@
+[project]
+name = "content-fabric-max"
+version = "0.1.0"
+description = "MAX messenger RSS news bot MVP"
+requires-python = ">=3.12"
+dependencies = [
+    "aiohttp",
+    "feedparser",
+    "pyyaml",
+    "python-dotenv",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["."]
+testpaths = ["max_news_bot/tests"]
+addopts = "-m 'not network and not llm'"
+markers = [
+    "network: tests hitting real external services (deselected by default)",
+    "llm: tests calling a real LLM API (manual run only)",
+]
