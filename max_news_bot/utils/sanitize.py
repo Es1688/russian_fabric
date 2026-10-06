@@ -4,8 +4,8 @@ import html
 import re
 from urllib.parse import urlsplit
 
-# Telegram HTML whitelist: <b>, <i>, <a href="http(s)://...">.
-# Tag-like sequences only: "< 3" in plain text is not a tag.
+# MAX html whitelist (same subset as Telegram): <b>, <i>,
+# <a href="http(s)://...">. Tag-like sequences only: "< 3" is not a tag.
 _TAG_RE = re.compile(r"</?[a-zA-Z][^>]*>")
 
 _B_OPEN_RE = re.compile(r"^<b\s*>$", re.IGNORECASE)
@@ -21,7 +21,7 @@ _ALLOWED_SCHEMES = ("http", "https")
 
 
 def sanitize_html(text: str) -> str:
-    """Whitelist-sanitize a post for Telegram's HTML parse mode.
+    """Whitelist-sanitize a post for MAX's html message format.
 
     - Only <b>, <i> and <a href="http(s)://..."> survive as markup;
     - text outside tags is html-escaped;

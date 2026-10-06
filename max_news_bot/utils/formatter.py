@@ -5,7 +5,8 @@ from html import escape
 from max_news_bot.core.models import NewsItem
 
 
-MAX_MESSAGE_LEN = 4096
+# MAX message hard limit (Telegram allowed 4096; MAX rejects anything longer)
+MAX_MESSAGE_LEN = 4000
 
 
 def format_items(items: list[NewsItem]) -> list[str]:
