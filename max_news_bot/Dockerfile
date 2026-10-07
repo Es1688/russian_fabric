@@ -10,6 +10,13 @@ WORKDIR /app
 
 RUN useradd --create-home --uid 10001 appuser
 
+# MAX Bot API (platform-api2.max.ru) serves TLS certificates issued by the
+# Russian national CA ("Russian Trusted Root CA", NUC/Minchtsifry). The root is
+# absent from Debian ca-certificates and certifi, so HTTPS to *.max.ru fails
+# with SSLError unless trusted explicitly; see max_news_bot/certs/README.md.
+COPY max_news_bot/certs/russian_trusted_root_ca.crt /usr/local/share/ca-certificates/russian_trusted_root_ca.crt
+RUN update-ca-certificates
+
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 COPY pyproject.toml uv.lock ./
