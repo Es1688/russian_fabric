@@ -201,10 +201,12 @@ def test_factory_dry_run_env_overrides_yaml(
     assert config.factory.dry_run is False
 
 
-def test_factory_llm_defaults_to_yandex(monkeypatch) -> None:
+def test_factory_llm_defaults_to_yandex(env_vars: None) -> None:
+    # env_vars keeps this hermetic: a real .env loaded by load_dotenv()
+    # inside an earlier load_config() call lingers in os.environ for the
+    # whole pytest session and would override the defaults under test
     from max_news_bot.config.loader import _parse_factory
 
-    monkeypatch.setenv("LLM_API_KEY", "test-llm-key")
     config = _parse_factory({})
 
     assert config.llm.base_url == "https://ai.api.cloud.yandex.net/v1"
