@@ -47,8 +47,10 @@ class MaxClient:
         *,
         fmt: str = "html",
         disable_link_preview: bool = False,
-    ) -> int:
-        """POST /messages; returns the created message id (mid)."""
+    ) -> str:
+        """POST /messages; returns the created message id (mid).
+
+        mid is a string like "mid.<id>", not an int."""
         params: dict[str, Any] = {"chat_id": chat_id}
         if disable_link_preview:
             params["disable_link_preview"] = "true"
@@ -60,7 +62,7 @@ class MaxClient:
         )
         return _extract_mid(body)
 
-    async def delete_message(self, message_id: int) -> None:
+    async def delete_message(self, message_id: str) -> None:
         """DELETE /messages; any 2xx (empty body included) is success."""
         await self._request(
             "DELETE", "/messages", params={"message_id": message_id}
@@ -174,11 +176,14 @@ def _parse_object(body: str, what: str) -> dict[str, Any]:
     return data
 
 
-def _extract_mid(body: str) -> int:
+def _extract_mid(body: str) -> str:
     """Pull the message id out of a /messages response.
 
     The canonical shape is message.body.mid; older/simplified shapes are
-    kept as fallbacks so an API tweak degrades to one typed error."""
+    kept as fallbacks so an API tweak degrades to one typed error. mid is
+    canonically a string like "mid.<id>" ((mid.)?[a-zA-Z0-9_-]+); a numeric
+    mid from a simplified response is coerced to str. The sibling seq field
+    is an int counter, NOT an id; it must never be picked here."""
     try:
         data = json.loads(body)
     except ValueError as exc:
@@ -188,9 +193,11 @@ def _extract_mid(body: str) -> int:
         _dig(data, "body", "mid"),
         _dig(data, "message", "mid"),
     ):
+        if isinstance(candidate, str):
+            return candidate
         # bool is an int subclass: a stray true must not pass as an id
         if isinstance(candidate, int) and not isinstance(candidate, bool):
-            return candidate
+            return str(candidate)
     raise MaxBadResponseError("/messages response has no message id")
 
 

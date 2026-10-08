@@ -12,7 +12,7 @@ from max_news_bot.max_api.errors import MaxApiError, MaxRateLimitError, classify
 
 _TOKEN = "test-max-token"
 _CHAT_ID = 4242
-_MID = 12345
+_MID = "mid.700001:1"
 
 
 class FakeMaxServer:
@@ -152,13 +152,16 @@ async def test_send_message_format_and_link_preview_params(max_server) -> None:
 @pytest.mark.parametrize(
     ("payload", "expected_mid"),
     [
-        ({"body": {"mid": 777}}, 777),
-        ({"message": {"mid": 888}}, 888),
+        # canonical shape: mid is a string like "mid.<id>"
+        ({"message": {"body": {"mid": "mid.700001:1"}}}, "mid.700001:1"),
         ({"message": {"body": {"mid": _MID, "seq": 1}}, "success": True}, _MID),
+        # simplified shapes with a numeric mid are coerced to str
+        ({"body": {"mid": 777}}, "777"),
+        ({"message": {"mid": 888}}, "888"),
     ],
 )
 async def test_send_message_mid_shapes(
-    max_server, payload: dict[str, Any], expected_mid: int
+    max_server, payload: dict[str, Any], expected_mid: str
 ) -> None:
     server, base_url = max_server
     server.send_payload = payload
@@ -172,11 +175,14 @@ async def test_send_message_mid_shapes(
     "payload",
     [
         {"success": True},
-        {"message": {"body": {"mid": "12345"}}},
         {"body": {"mid": None}},
+        # bool is an int subclass: a stray true must not pass as an id
+        {"message": {"body": {"mid": True}}},
+        # seq is an int counter, not an id: no mid -> typed error
+        {"message": {"body": {"seq": 5}}},
     ],
 )
-async def test_send_message_without_int_mid_raises(max_server, payload) -> None:
+async def test_send_message_without_mid_raises(max_server, payload) -> None:
     server, base_url = max_server
     server.send_payload = payload
 
@@ -308,7 +314,9 @@ async def test_get_me_returns_dict(max_server) -> None:
 
 async def test_patch_commands_posts_commands_body(max_server) -> None:
     server, base_url = max_server
-    commands = [{"command": "/status", "description": "Show bot status"}]
+    # BotCommand schema: bare command name (no leading slash) + description,
+    # same shape as handlers.BOT_COMMANDS
+    commands = [{"name": "status", "description": "Show bot status"}]
 
     await make_client(base_url).patch_commands(commands)  # must not raise
 

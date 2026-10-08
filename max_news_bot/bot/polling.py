@@ -37,7 +37,8 @@ async def polling_loop(
                 marker, timeout=30, types=_UPDATE_TYPES
             )
         except Exception as exc:
-            logger.error("polling_get_updates_failed error=%s", exc)
+            error = f"{type(exc).__name__}: {exc}"[:_MAX_ERROR_LEN]
+            logger.error("polling_get_updates_failed error=%s", error)
             await asyncio.sleep(_RETRY_DELAY_SECONDS)
             continue
 

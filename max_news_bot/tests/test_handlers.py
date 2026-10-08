@@ -62,17 +62,17 @@ class RecordingClient:
 
     def __init__(self, *, raise_on_delete: Exception | None = None) -> None:
         self.sent: list[tuple[int, str, str]] = []
-        self.deleted: list[int] = []
+        self.deleted: list[str] = []
         self._raise_on_delete = raise_on_delete
 
     async def send_message(
         self, chat_id: int, text: str, *, fmt: str = "html",
         disable_link_preview: bool = False,
-    ) -> int:
+    ) -> str:
         self.sent.append((chat_id, text, fmt))
-        return len(self.sent)
+        return f"mid.{len(self.sent)}"
 
-    async def delete_message(self, message_id: int) -> None:
+    async def delete_message(self, message_id: str) -> None:
         if self._raise_on_delete is not None:
             raise self._raise_on_delete
         self.deleted.append(message_id)
@@ -160,17 +160,21 @@ def factory_setup(app_config: AppConfig, db: Database):
 
 
 def test_bot_commands_registry_shape() -> None:
-    assert {"command", "description"} == set(BOT_COMMANDS[0].keys())
-    assert [entry["command"] for entry in BOT_COMMANDS] == [
-        "/start",
-        "/chatid",
-        "/status",
-        "/sources",
-        "/stats",
-        "/news",
-        "/factory",
-        "/posts",
+    # PATCH /me/commands expects {"commands":[{"name": ..., "description": ...}]}
+    # with bare names (no leading slash).
+    assert {"name", "description"} == set(BOT_COMMANDS[0].keys())
+    assert all(set(entry.keys()) == {"name", "description"} for entry in BOT_COMMANDS)
+    assert [entry["name"] for entry in BOT_COMMANDS] == [
+        "start",
+        "chatid",
+        "status",
+        "sources",
+        "stats",
+        "news",
+        "factory",
+        "posts",
     ]
+    assert not any(entry["name"].startswith("/") for entry in BOT_COMMANDS)
 
 
 # --- /start and /chatid -------------------------------------------------------
@@ -345,7 +349,7 @@ async def test_factory_usage_hint_on_unknown_action(factory_setup) -> None:
 
 async def test_factory_retract_deletes_channel_message(factory_setup) -> None:
     post_id = await factory_setup.db.save_attempt(_make_post(status="draft"))
-    await factory_setup.db.mark_post_published(post_id, 555)
+    await factory_setup.db.mark_post_published(post_id, "mid.555")
 
     await _invoke(
         factory_setup,
@@ -354,7 +358,7 @@ async def test_factory_retract_deletes_channel_message(factory_setup) -> None:
     )
 
     # MaxClient.delete_message takes the message id only (no chat_id)
-    assert factory_setup.client.deleted == [555]
+    assert factory_setup.client.deleted == ["mid.555"]
     assert any("retracted" in text for text in _texts(factory_setup))
     event = await factory_setup.db.get_last_event("factory_retract")
     assert event is not None
@@ -388,7 +392,7 @@ async def test_factory_retract_unknown_post(factory_setup) -> None:
 async def test_factory_retract_reports_api_failure(factory_setup) -> None:
     factory_setup.client._raise_on_delete = RuntimeError("max is down")
     post_id = await factory_setup.db.save_attempt(_make_post(status="draft"))
-    await factory_setup.db.mark_post_published(post_id, 556)
+    await factory_setup.db.mark_post_published(post_id, "mid.556")
 
     await _invoke(
         factory_setup,

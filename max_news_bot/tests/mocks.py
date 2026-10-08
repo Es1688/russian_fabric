@@ -138,7 +138,7 @@ class MockPostPublisher:
         raise_on_publish: Exception | None = None,
     ) -> None:
         self.result = result or PostPublishResult(
-            success=True, message_id=1000, error=None
+            success=True, message_id="mid.1000", error=None
         )
         self.raise_on_publish = raise_on_publish
         self.calls: list[tuple[Post, bool]] = []

@@ -38,7 +38,7 @@ def conn(tmp_path):
             prompt_version TEXT,
             llm_model TEXT,
             tokens INTEGER,
-            message_id INTEGER,
+            message_id TEXT,
             rejected_text TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             published_at TIMESTAMP,

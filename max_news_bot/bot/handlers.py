@@ -31,14 +31,14 @@ _START_TEXT = (
 
 # Registered via PATCH /me/commands at startup (best-effort).
 BOT_COMMANDS: list[dict] = [
-    {"command": "/start", "description": "Приветствие и подписка на личные сообщения"},
-    {"command": "/chatid", "description": "Показать chat_id этого чата"},
-    {"command": "/status", "description": "Состояние бота"},
-    {"command": "/sources", "description": "Список RSS-источников"},
-    {"command": "/stats", "description": "Статистика по дням"},
-    {"command": "/news", "description": "Запустить сбор новостей (админ)"},
-    {"command": "/factory", "description": "Управление фабрикой контента (админ)"},
-    {"command": "/posts", "description": "Последние посты (админ)"},
+    {"name": "start", "description": "Приветствие и подписка на личные сообщения"},
+    {"name": "chatid", "description": "Показать chat_id этого чата"},
+    {"name": "status", "description": "Состояние бота"},
+    {"name": "sources", "description": "Список RSS-источников"},
+    {"name": "stats", "description": "Статистика по дням"},
+    {"name": "news", "description": "Запустить сбор новостей (админ)"},
+    {"name": "factory", "description": "Управление фабрикой контента (админ)"},
+    {"name": "posts", "description": "Последние посты (админ)"},
 ]
 
 

@@ -27,7 +27,7 @@ class Post:
     prompt_version: str | None = None  # sha1(prompt)[:8]
     llm_model: str | None = None
     tokens: int | None = None
-    message_id: int | None = None  # channel sends; NULL in dry-run
+    message_id: str | None = None  # channel mid ("mid.<id>"); NULL in dry-run
     rejected_text: str | None = None  # validator rejection, truncated
     created_at: datetime | None = None
     published_at: datetime | None = None

@@ -111,7 +111,31 @@ async def test_polling_handles_updates_advances_marker_and_survives_errors(
 
     messages = [record.getMessage() for record in caplog.records]
     assert any("unhandled_error error=ValueError: boom" in m for m in messages)
-    assert any("polling_get_updates_failed" in m for m in messages)
+    assert any(
+        "polling_get_updates_failed error=RuntimeError: network down" in m
+        for m in messages
+    )
+
+
+async def test_polling_get_updates_failure_logs_exception_type(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    # TimeoutError str() is empty; the log must still name the exception type
+    monkeypatch.setattr(polling, "_RETRY_DELAY_SECONDS", 0)
+    db = await _make_db(tmp_path)
+
+    async def handle_update(update: dict) -> None:
+        return None
+
+    client = ScriptedClient([asyncio.TimeoutError()])
+
+    with caplog.at_level(logging.ERROR, logger="max_news_bot.bot.polling"):
+        await _run_until_parked(client, handle_update, db)
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "polling_get_updates_failed error=TimeoutError" in m for m in messages
+    )
 
 
 async def test_polling_reuses_marker_when_api_returns_none(tmp_path) -> None:

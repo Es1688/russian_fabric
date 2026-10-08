@@ -137,7 +137,7 @@ async def test_happy_path_publishes_posts(db, app_config) -> None:
     posts = await db.get_recent_posts(10)
     assert len(posts) == 2
     assert all(post.status == "published" for post in posts)
-    assert all(post.message_id == 1000 for post in posts)
+    assert all(post.message_id == "mid.1000" for post in posts)
 
     # the factory never reads or writes sent_news: digest and factory
     # are independent consumers, duplicates between them are allowed
@@ -383,7 +383,7 @@ async def test_recovery_publishes_stale_draft_without_writer(db, app_config) -> 
     assert result.recovered == 1
     posts = await db.get_recent_posts(10)
     assert posts[0].status == "published"
-    assert posts[0].message_id == 1000
+    assert posts[0].message_id == "mid.1000"
     assert len(publisher.calls) == 1
 
 

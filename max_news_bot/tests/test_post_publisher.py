@@ -40,7 +40,7 @@ def no_send_pause(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(MaxPostPublisher, "SEND_PAUSE_SECONDS", 0.0)
 
 
-def make_client(side_effect=None, mid: int = 42) -> AsyncMock:
+def make_client(side_effect=None, mid: str = "mid.42") -> AsyncMock:
     client = AsyncMock()
     if side_effect is not None:
         client.send_message.side_effect = side_effect
@@ -68,13 +68,13 @@ def rate_limit() -> MaxRateLimitError:
 
 
 async def test_channel_send_appends_source_link_and_uses_html() -> None:
-    client = make_client(mid=42)
+    client = make_client(mid="mid.42")
     publisher = make_publisher(client)
 
     result = await publisher.publish_post(make_post())
 
     assert result.success is True
-    assert result.message_id == 42  # MAX mid returned as message_id
+    assert result.message_id == "mid.42"  # MAX mid string returned as-is
     assert result.error is None
     client.send_message.assert_awaited_once()
     assert call_args(client)[0] == _CHANNEL
@@ -111,13 +111,13 @@ async def test_rate_limit_is_retried_and_succeeds(
         sleeps.append(seconds)
 
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
-    client = make_client(side_effect=[rate_limit(), 7])
+    client = make_client(side_effect=[rate_limit(), "mid.7"])
     publisher = make_publisher(client)
 
     result = await publisher.publish_post(make_post())
 
     assert result.success is True
-    assert result.message_id == 7
+    assert result.message_id == "mid.7"
     assert client.send_message.await_count == 2
     # MAX has no retry_after: fixed backoff of attempt * SEND_PAUSE_SECONDS
     assert sleeps == [2.5]
@@ -159,13 +159,13 @@ async def test_parse_error_falls_back_to_plain_text() -> None:
     parse_error = MaxApiError(
         400, "parse.failed", "can't parse entities: unsupported tag"
     )
-    client = make_client(side_effect=[parse_error, 9])
+    client = make_client(side_effect=[parse_error, "mid.9"])
     publisher = make_publisher(client)
 
     result = await publisher.publish_post(make_post())
 
     assert result.success is True
-    assert result.message_id == 9
+    assert result.message_id == "mid.9"
     assert client.send_message.await_count == 2
     # MAX has no "no format" mode: the fallback is still fmt=html, but with
     # tags stripped and everything escaped — guaranteed-valid html
@@ -220,7 +220,7 @@ async def test_bad_response_error_is_infra() -> None:
 
 
 async def test_admins_mode_sends_preview_to_every_admin() -> None:
-    client = make_client(mid=55)
+    client = make_client(mid="mid.55")
     publisher = make_publisher(client)
 
     result = await publisher.publish_post(make_post(), to_admins=True)
@@ -238,7 +238,7 @@ async def test_admins_mode_sends_preview_to_every_admin() -> None:
 
 
 async def test_one_admin_failure_does_not_block_others() -> None:
-    client = make_client(side_effect=[RuntimeError("dm closed"), 1, 2])
+    client = make_client(side_effect=[RuntimeError("dm closed"), "mid.1", "mid.2"])
     publisher = make_publisher(client)
 
     result = await publisher.publish_post(make_post(), to_admins=True)
@@ -285,7 +285,7 @@ async def test_empty_post_text_is_rejected() -> None:
 
 
 async def test_source_link_ampersand_is_escaped() -> None:
-    client = make_client(mid=5)
+    client = make_client(mid="mid.5")
     publisher = make_publisher(client)
     post = replace(make_post(), news_url="https://example.com/news?a=1&b=2")
 
@@ -311,7 +311,7 @@ async def test_pause_applies_between_consecutive_sends(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(MaxPostPublisher, "SEND_PAUSE_SECONDS", 0.1)
-    client = make_client(mid=1)
+    client = make_client(mid="mid.1")
     publisher = make_publisher(client)
 
     started = time.monotonic()

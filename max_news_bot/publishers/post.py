@@ -32,7 +32,7 @@ _PARSE_ERROR_MARKERS = ("parse", "format", "markup", "validation", "entities")
 @dataclass(frozen=True)
 class PostPublishResult:
     success: bool
-    message_id: int | None
+    message_id: str | None
     error: str | None
     # "content" (text itself is unusable — burns an attempt) or "infra"
     # (network/flood — retried for free, plan P0.3); None means unknown/infra
@@ -125,8 +125,8 @@ class MaxPostPublisher:
 
     async def _send_with_retries(
         self, chat_id: int, message: str, *, fmt: str = "html"
-    ) -> int:
-        """send_message with rate-limit retry; returns the message id (mid)."""
+    ) -> str:
+        """send_message with rate-limit retry; returns the mid string."""
         for attempt in range(1, _MAX_SEND_ATTEMPTS + 1):
             if self._sends > 0:
                 await asyncio.sleep(self.SEND_PAUSE_SECONDS)
@@ -135,7 +135,7 @@ class MaxPostPublisher:
                     chat_id, message, fmt=fmt, disable_link_preview=False
                 )
                 self._sends += 1
-                return int(mid)
+                return mid
             except MaxRateLimitError as exc:
                 if attempt == _MAX_SEND_ATTEMPTS:
                     raise

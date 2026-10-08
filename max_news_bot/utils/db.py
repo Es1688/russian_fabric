@@ -84,9 +84,81 @@ def _migrate_v2(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_v3(conn: sqlite3.Connection) -> None:
+    """posts.message_id INTEGER -> TEXT (MAX mid is a "mid.<id>" string).
+
+    SQLite has no ALTER COLUMN: the table is rebuilt with the exact v2
+    schema except message_id TEXT, copying every row (ints cast to str by
+    CAST, NULL stays NULL) and keeping ids, UNIQUE(news_url) and defaults.
+    CREATE TABLE runs in autocommit (Python sqlite3 starts no transaction
+    before DDL), so a hard kill mid-migration can leave a dangling
+    posts_new; dropping it first makes the step safe to re-run. The rebuild
+    also resets the AUTOINCREMENT counter to max(id), so the pre-rebuild
+    sqlite_sequence value is restored to keep ids of deleted rows unused.
+    """
+    conn.execute("DROP TABLE IF EXISTS posts_new")
+    conn.execute(
+        """
+        CREATE TABLE posts_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            news_url TEXT UNIQUE NOT NULL,
+            source TEXT NOT NULL,
+            title TEXT NOT NULL,
+            text TEXT,
+            status TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            error TEXT,
+            prompt_version TEXT,
+            llm_model TEXT,
+            tokens INTEGER,
+            message_id TEXT,
+            rejected_text TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            published_at TIMESTAMP,
+            last_attempt_at TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO posts_new (
+            id, news_url, source, title, text, status, attempts, error,
+            prompt_version, llm_model, tokens, message_id, rejected_text,
+            created_at, published_at, last_attempt_at
+        )
+        SELECT
+            id, news_url, source, title, text, status, attempts, error,
+            prompt_version, llm_model, tokens, CAST(message_id AS TEXT),
+            rejected_text, created_at, published_at, last_attempt_at
+        FROM posts
+        """
+    )
+    seq_row = conn.execute(
+        "SELECT seq FROM sqlite_sequence WHERE name = 'posts'"
+    ).fetchone()
+    conn.execute("DROP TABLE posts")
+    conn.execute("ALTER TABLE posts_new RENAME TO posts")
+    if seq_row is not None:
+        # the renamed entry (or its absence, for an empty posts) may sit
+        # below the pre-rebuild counter: raise it back, never lower it
+        conn.execute(
+            "UPDATE sqlite_sequence SET seq = ? WHERE name = 'posts' AND seq < ?",
+            (seq_row[0], seq_row[0]),
+        )
+        conn.execute(
+            """
+            INSERT INTO sqlite_sequence (name, seq)
+            SELECT 'posts', ? WHERE NOT EXISTS
+                (SELECT 1 FROM sqlite_sequence WHERE name = 'posts')
+            """,
+            (seq_row[0],),
+        )
+
+
 _MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _migrate_v1,
     _migrate_v2,
+    _migrate_v3,
 ]
 
 
@@ -137,7 +209,11 @@ class Database:
         with _connect(self._path) as conn:
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
         if existed and version < len(_MIGRATIONS):
-            # safety copy of a pre-existing database file before upgrading it
+            # safety copy of a pre-existing database file before upgrading it;
+            # checkpoint WAL first so the copy holds every committed row
+            # (a bare file copy misses frames still sitting in the -wal file)
+            with _connect(self._path) as conn:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             backup = self._path.with_name(f"{self._path.name}.bak-v{version}")
             shutil.copy2(self._path, backup)
         with _connect(self._path) as conn:
@@ -297,14 +373,14 @@ class Database:
             return int(row[0])
 
     async def mark_post_published(
-        self, post_id: int, message_id: int | None
+        self, post_id: int, message_id: str | None
     ) -> None:
         await asyncio.to_thread(
             self._mark_post_published_sync, post_id, message_id
         )
 
     def _mark_post_published_sync(
-        self, post_id: int, message_id: int | None
+        self, post_id: int, message_id: str | None
     ) -> None:
         with _connect(self._path) as conn:
             conn.execute(
