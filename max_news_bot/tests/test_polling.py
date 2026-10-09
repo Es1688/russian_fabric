@@ -11,14 +11,14 @@ from max_news_bot.utils.db import Database
 
 
 def make_update(mid: int = 1) -> dict:
+    # real MAX shape: message sits directly on the update object
     return {
         "update_type": "message_created",
         "timestamp": 123,
-        "marker": 456,
-        "update": {
+        "message": {
             "sender": {"user_id": 42, "name": "Tester"},
             "recipient": {"chat_id": -100200300, "chat_type": "dialog"},
-            "message": {"body": {"text": "/status", "mid": mid}, "timestamp": 123},
+            "body": {"text": "/status", "mid": f"mid.{mid}"},
         },
     }
 

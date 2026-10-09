@@ -32,29 +32,30 @@ def make_update(
     user_id: int = NON_ADMIN_ID,
     chat_id: int = CHAT_ID,
 ) -> dict:
-    """Hand-made MAX message_created update (defensive-parse target)."""
+    """Hand-made MAX message_created update (defensive-parse target).
+
+    Shape matches the real API (no "update" wrapper — message sits directly
+    on the update object, sender/recipient inside message)."""
     return {
         "update_type": "message_created",
         "timestamp": 123,
-        "marker": 456,
-        "update": {
+        "message": {
             "sender": {"user_id": user_id, "name": "Tester"},
             "recipient": {"chat_id": chat_id, "chat_type": "dialog"},
-            "message": {"body": {"text": text, "mid": 789}, "timestamp": 123},
+            "body": {"text": text, "mid": "mid.789"},
         },
+        "user_locale": "ru",
     }
 
 
-def make_bot_started_update(
-    *, user_id: int = 42, chat_id: int = CHAT_ID, with_sender: bool = False
-) -> dict:
-    inner: dict = {"chat_id": chat_id, "user_id": user_id}
-    if with_sender:
-        inner = {
-            "sender": {"user_id": user_id},
-            "recipient": {"chat_id": chat_id, "chat_type": "dialog"},
-        }
-    return {"update_type": "bot_started", "timestamp": 123, "marker": 456, "update": inner}
+def make_bot_started_update(*, user_id: int = 42, chat_id: int = CHAT_ID) -> dict:
+    # real bot_started carries chat_id and the acting user directly
+    return {
+        "update_type": "bot_started",
+        "timestamp": 123,
+        "chat_id": chat_id,
+        "user": {"user_id": user_id, "name": "Tester"},
+    }
 
 
 class RecordingClient:
@@ -195,13 +196,6 @@ async def test_bot_started_replies_greeting(handler_setup) -> None:
 
     assert len(handler_setup.client.sent) == 1
     assert "Привет" in handler_setup.client.sent[0][1]
-
-    # sender-shaped variant answers too
-    handler_setup.client.sent.clear()
-    await handler_setup.handle_update(
-        make_bot_started_update(user_id=42, with_sender=True)
-    )
-    assert len(handler_setup.client.sent) == 1
 
 
 async def test_chatid_replies_with_current_chat_id(handler_setup) -> None:
@@ -478,25 +472,33 @@ async def test_malformed_updates_do_not_raise(handler_setup) -> None:
         {},
         None,
         {"update_type": "message_created"},
-        {"update": {}},
-        {"update_type": "message_created", "update": {"recipient": {}}},
-        {"update_type": "message_created", "update": {"recipient": {"chat_id": "abc"}}},
+        {"message": {}},
+        # legacy TamTam-style wrapper: must be treated as unknown shape
         {
             "update_type": "message_created",
             "update": {
+                "sender": {"user_id": 42},
                 "recipient": {"chat_id": CHAT_ID},
-                "message": {},
             },
+        },
+        {"update_type": "message_created", "message": {"recipient": {}}},
+        {
+            "update_type": "message_created",
+            "message": {"recipient": {"chat_id": "abc"}},
         },
         {
             "update_type": "message_created",
-            "update": {
+            "message": {"recipient": {"chat_id": CHAT_ID}, "body": {}},
+        },
+        {
+            "update_type": "message_created",
+            "message": {
                 "recipient": {"chat_id": CHAT_ID},
                 "sender": {"user_id": True},  # bool must not pass as an id
-                "message": {"body": {"text": "just chatting"}},
+                "body": {"text": "just chatting"},
             },
         },
-        {"update_type": 42, "update": {"recipient": {"chat_id": CHAT_ID}}},
+        {"update_type": 42, "message": {"recipient": {"chat_id": CHAT_ID}}},
     ]
     for update in broken_updates:
         await handler_setup.handle_update(update)

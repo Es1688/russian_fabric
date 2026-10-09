@@ -219,6 +219,11 @@ def create_dispatcher(
         chat_id, user_id, update_type, text = _parse_update(update)
         if chat_id is None:
             # malformed/non-message update: nothing to answer
+            logger.debug(
+                "update_ignored update_type=%s payload=%s",
+                update_type or "unknown",
+                update,
+            )
             return
         try:
             if update_type == "bot_started":
@@ -261,35 +266,43 @@ def _parse_update(
     update: dict,
 ) -> tuple[int | None, int | None, str, str | None]:
     """Defensively dig (chat_id, sender_user_id, update_type, text) out of a
-    MAX update dict; missing/broken levels degrade to None instead of raising."""
+    MAX update dict; missing/broken levels degrade to None instead of raising.
+
+    Real MAX shapes (no TamTam-era "update" wrapper — fields sit directly
+    on the update object):
+    message_created: {update_type, timestamp, message: {sender, recipient,
+        body: {text}}, user_locale}
+    bot_started: {update_type, timestamp, chat_id, user: {user_id}}
+    """
     if not isinstance(update, dict):
         return None, None, "", None
     update_type = update.get("update_type")
     if not isinstance(update_type, str):
         update_type = ""
-    inner = update.get("update")
-    if not isinstance(inner, dict):
-        inner = {}
+    message = update.get("message")
+    if not isinstance(message, dict):
+        message = {}
 
-    recipient = inner.get("recipient")
+    recipient = message.get("recipient")
     chat_id = (
         _int_or_none(recipient.get("chat_id"))
         if isinstance(recipient, dict)
         else None
     )
     if chat_id is None:
-        # bot_started and some shapes carry the chat id at the update level
-        chat_id = _int_or_none(inner.get("chat_id"))
+        # bot_started and other chat-level events carry the chat id directly
+        chat_id = _int_or_none(update.get("chat_id"))
 
-    sender = inner.get("sender")
+    sender = message.get("sender")
     user_id = (
         _int_or_none(sender.get("user_id")) if isinstance(sender, dict) else None
     )
     if user_id is None:
-        user_id = _int_or_none(inner.get("user_id"))
+        # bot_started/bot_added carry the acting user directly
+        user = update.get("user")
+        user_id = _int_or_none(user.get("user_id")) if isinstance(user, dict) else None
 
-    message = inner.get("message")
-    body = message.get("body") if isinstance(message, dict) else None
+    body = message.get("body")
     text = body.get("text") if isinstance(body, dict) else None
     if not isinstance(text, str):
         text = None
