@@ -1,0 +1,25 @@
+# Confirmed RSS sources for the "Good news" rubric (operator sign-off 2026-10-10).
+# All feeds verified on 2026-10-09: reachable, title/link/date/description complete.
+# Verification details: docs/plans/2026-10-09-epoch0-research.md
+sources:
+  - name: Газета.Ru — Культура
+    url: https://www.gazeta.ru/export/rss/culture.xml
+    section: culture
+  - name: Газета.Ru — Наука
+    url: https://www.gazeta.ru/export/rss/science.xml
+    section: science
+  - name: Газета.Ru — Спорт
+    url: https://www.gazeta.ru/export/rss/sport.xml
+    section: sport
+  - name: N+1
+    url: https://nplus1.ru/rss
+    section: science
+  - name: Наука и жизнь
+    url: https://nkj.ru/rss/
+    section: science
+  - name: Вокруг света
+    url: https://www.vokrugsveta.ru/rss-feeds/rss.xml
+    section: nature
+  - name: Sports.ru
+    url: https://www.sports.ru/rss/all_news.xml
+    section: sport

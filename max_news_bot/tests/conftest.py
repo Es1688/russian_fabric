@@ -15,6 +15,7 @@ from max_news_bot.config.loader import (
     LlmConfig,
     SourceConfig,
 )
+from max_news_bot.config.rubrics import empty_rubrics_config
 from max_news_bot.core.factory import ContentFactory
 from max_news_bot.core.models import NewsItem
 from max_news_bot.utils.db import Database
@@ -129,6 +130,7 @@ def app_config(tmp_path: Path, factory_config: FactoryConfig) -> AppConfig:
         ],
         data_path=tmp_path / "max_news_bot.db",
         factory=factory_config,
+        rubrics=empty_rubrics_config(),
     )
 
 

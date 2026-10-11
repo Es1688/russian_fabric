@@ -6,9 +6,13 @@ from datetime import datetime, timezone
 
 import aiohttp
 
+from max_news_bot.bot.daily_summary import daily_summary_loop
+from max_news_bot.bot.db_backup import daily_backup_loop
 from max_news_bot.bot.handlers import BOT_COMMANDS, create_dispatcher
 from max_news_bot.bot.polling import polling_loop
+from max_news_bot.bot.rubrics_runtime import RubricsRuntime, build_rubrics_runtime
 from max_news_bot.bot.scheduler import factory_scheduler_loop, scheduler_loop
+from max_news_bot.bot.slot_scheduler import slot_scheduler_loop
 from max_news_bot.config.loader import load_config
 from max_news_bot.core.factory import ContentFactory
 from max_news_bot.core.pipeline import Pipeline
@@ -63,6 +67,13 @@ async def main() -> None:
         factory = ContentFactory(config, fetcher, writer, post_publisher, alerter, db)
         factory_lock = asyncio.Lock()
 
+    # RUBRICS_ENABLED contour (plan sections 8 and 14): built only when
+    # enabled; config validation guarantees the legacy factory loop is off
+    # in that case, so no second publishing contour can appear here.
+    runtime: RubricsRuntime | None = None
+    if config.rubrics.enabled:
+        runtime = build_rubrics_runtime(config, db, client, http_session, fetcher)
+
     handle_update = create_dispatcher(
         config,
         pipeline,
@@ -72,6 +83,7 @@ async def main() -> None:
         factory=factory,
         factory_lock=factory_lock,
         client=client,
+        rubrics_admin=runtime.admin if runtime is not None else None,
     )
 
     # Best-effort startup checks: neither a failing /me nor a failing
@@ -86,15 +98,45 @@ async def main() -> None:
     except Exception as exc:
         logger.warning("startup_patch_commands_failed error=%s", exc)
 
-    scheduler_task = asyncio.create_task(
-        scheduler_loop(pipeline, config.settings.post_interval_hours, publish_lock, db)
-    )
-    factory_task = None
-    if factory is not None and factory_lock is not None:
-        factory_task = asyncio.create_task(
-            factory_scheduler_loop(
-                factory, config.factory.interval_hours, factory_lock, db
+    # Contour switch (plan sections 8 and 14): exactly one publishing
+    # contour runs. RUBRICS_ENABLED=true starts the slot scheduler with
+    # its summary and backup tasks, and both legacy loops stay down (the
+    # config validation has already failed the launch on a conflict);
+    # with the flag off the process behaves exactly as before.
+    background_tasks: list[asyncio.Task] = []
+    if runtime is not None:
+        background_tasks = [
+            asyncio.create_task(slot_scheduler_loop(runtime.scheduler, db)),
+            asyncio.create_task(daily_summary_loop(runtime.summary, db)),
+            asyncio.create_task(
+                daily_backup_loop(runtime.backup, db, alerter=runtime.alerter)
+            ),
+        ]
+        logger.info(
+            "rubrics_contour_started dry_run=%s rubrics=%s summary_time=%s",
+            config.rubrics.dry_run,
+            len([r for r in config.rubrics.rubrics if r.enabled]),
+            config.rubrics.summary_time,
+        )
+    else:
+        background_tasks.append(
+            asyncio.create_task(
+                scheduler_loop(
+                    pipeline, config.settings.post_interval_hours, publish_lock, db
+                )
             )
+        )
+        if factory is not None and factory_lock is not None:
+            background_tasks.append(
+                asyncio.create_task(
+                    factory_scheduler_loop(
+                        factory, config.factory.interval_hours, factory_lock, db
+                    )
+                )
+            )
+        logger.info(
+            "legacy_contour_started interval_hours=%s",
+            config.settings.post_interval_hours,
         )
 
     polling_task = asyncio.create_task(polling_loop(client, handle_update, db))
@@ -104,9 +146,7 @@ async def main() -> None:
         # main awaited task and everything else is cancelled when it ends
         await polling_task
     finally:
-        for task in (polling_task, scheduler_task, factory_task):
-            if task is None:
-                continue
+        for task in [polling_task, *background_tasks]:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task

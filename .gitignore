@@ -18,6 +18,8 @@ venv/
 
 # ZCode / Engineering Hub
 .zcode/plans/
+.zcode/workflow-drafts/
+.zcode/workflow-runs/
 
 # Editor debug logs
 .cursor/

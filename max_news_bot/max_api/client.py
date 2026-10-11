@@ -47,20 +47,74 @@ class MaxClient:
         *,
         fmt: str = "html",
         disable_link_preview: bool = False,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> str:
         """POST /messages; returns the created message id (mid).
 
-        mid is a string like "mid.<id>", not an int."""
+        mid is a string like "mid.<id>", not an int. ``attachments`` is the
+        raw MAX attachments array, e.g.
+        [{"type": "image", "payload": {"token": "<mediafile_token>"}}]."""
         params: dict[str, Any] = {"chat_id": chat_id}
         if disable_link_preview:
             params["disable_link_preview"] = "true"
+        message: dict[str, Any] = {"text": text, "format": fmt, "notify": True}
+        if attachments is not None:
+            message["attachments"] = attachments
         body = await self._request(
-            "POST",
-            "/messages",
-            params=params,
-            json_body={"text": text, "format": fmt, "notify": True},
+            "POST", "/messages", params=params, json_body=message
         )
         return _extract_mid(body)
+
+    async def get_upload_url(self, upload_type: str) -> dict[str, Any]:
+        """POST /uploads?type=...: the CDN url for the next step.
+
+        For audio/video the response also carries the attachment token
+        already; for image/file the token only appears after the file
+        upload (docs are contradictory here - extract_upload_token checks
+        both places)."""
+        body = await self._request(
+            "POST", "/uploads", params={"type": upload_type}
+        )
+        return _parse_object(body, "/uploads")
+
+    async def upload_media(
+        self,
+        upload_url: str,
+        data: bytes,
+        filename: str,
+        content_type: str,
+        *,
+        send_auth: bool = False,
+        total_timeout: int | None = None,
+    ) -> dict[str, Any]:
+        """POST the file as multipart/form-data to the full CDN url.
+
+        The upload url returned by /uploads points at external CDN hosts
+        (not platform-api), so it is used verbatim. The multipart body has
+        a single field ``data`` holding the file. Doc examples for
+        audio/video/file send no Authorization header on the CDN host
+        (only the image example has it) - hence the ``send_auth`` flag.
+        A 200 with an empty body (audio) is fine: returns {}."""
+        form = aiohttp.FormData()
+        form.add_field("data", data, filename=filename, content_type=content_type)
+        body = await self._request(
+            "POST",
+            upload_url,
+            form=form,
+            send_auth=send_auth,
+            total_timeout=total_timeout,
+        )
+        if not body.strip():
+            return {}
+        try:
+            parsed = json.loads(body)
+        except ValueError as exc:
+            raise MaxBadResponseError(
+                f"upload response is not JSON: {exc}"
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise MaxBadResponseError("upload response is not an object")
+        return parsed
 
     async def delete_message(self, message_id: str) -> None:
         """DELETE /messages; any 2xx (empty body included) is success."""
@@ -112,29 +166,43 @@ class MaxClient:
         *,
         params: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
+        form: aiohttp.FormData | None = None,
+        send_auth: bool = True,
         total_timeout: int | None = None,
     ) -> str:
         """One API call; returns the raw response body text.
 
+        ``path`` is appended to base_url unless it is already a full url
+        (CDN upload targets come back from /uploads as absolute urls).
         Raises MaxApiError/MaxRateLimitError on non-2xx; network and timeout
         exceptions propagate as-is (classify_error maps them later)."""
-        # MAX auth is the RAW access token — NO "Bearer" prefix, unlike
-        # OpenAI-style APIs; a prefixed header is rejected with 401
-        headers = {"Authorization": self._token}
+        headers: dict[str, str] = {}
+        if send_auth:
+            # MAX auth is the RAW access token — NO "Bearer" prefix, unlike
+            # OpenAI-style APIs; a prefixed header is rejected with 401
+            headers["Authorization"] = self._token
         if json_body is not None:
             headers["Content-Type"] = "application/json"
+        # with a form body aiohttp must set Content-Type itself (boundary)
         logger.debug("max_api_request method=%s path=%s", method, path)
         client_timeout = aiohttp.ClientTimeout(
             total=self._timeout if total_timeout is None else total_timeout
         )
-        url = f"{self._base_url}{path}"
+        url = path if path.startswith(("http://", "https://")) else f"{self._base_url}{path}"
         if self._session is not None:
             return await _send(
-                self._session, method, url, params, json_body, headers, client_timeout
+                self._session,
+                method,
+                url,
+                params,
+                json_body,
+                form,
+                headers,
+                client_timeout,
             )
         async with aiohttp.ClientSession() as session:
             return await _send(
-                session, method, url, params, json_body, headers, client_timeout
+                session, method, url, params, json_body, form, headers, client_timeout
             )
 
 
@@ -153,11 +221,18 @@ async def _send(
     url: str,
     params: dict[str, Any] | None,
     json_body: dict[str, Any] | None,
+    form: aiohttp.FormData | None,
     headers: dict[str, str],
     timeout: aiohttp.ClientTimeout,
 ) -> str:
     async with session.request(
-        method, url, params=params, json=json_body, headers=headers, timeout=timeout
+        method,
+        url,
+        params=params,
+        json=json_body,
+        data=form,
+        headers=headers,
+        timeout=timeout,
     ) as response:
         body = await response.text()
         if not response.ok:
@@ -209,6 +284,20 @@ def _dig(data: Any, *keys: str) -> Any:
             return None
         current = current.get(key)
     return current
+
+
+def extract_upload_token(data: dict[str, Any]) -> str:
+    """The mediafile token of an upload response.
+
+    The docs are contradictory about where the token lives (research
+    report section 1.3): audio/video return it in /uploads as
+    ``{"token": ...}``, images only after the file upload as
+    ``{"photos": {"photoIds": {"token": ...}}}``. Both places are checked;
+    no token anywhere is a typed error."""
+    for candidate in (data.get("token"), _dig(data, "photos", "photoIds", "token")):
+        if isinstance(candidate, str) and candidate:
+            return candidate
+    raise MaxBadResponseError("upload response has no attachment token")
 
 
 def _error_response(status: int, body: str) -> MaxApiError:

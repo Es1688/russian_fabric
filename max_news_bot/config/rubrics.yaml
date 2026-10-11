@@ -1,0 +1,226 @@
+# Конфиг рубрик автономного канала — сетка из плана §2, схема из §8
+# (docs/plans/2026-10-09-autonomous-channel.md). Валидируется при старте:
+# опечатка в ключе или значении роняет запуск, а не пост в 07:00.
+#
+# Контур рубрик включается env-флагом RUBRICS_ENABLED=true (по умолчанию
+# false). Одновременно с legacy-циклами (FACTORY_ENABLED=true) он запрещён —
+# конфликт роняет запуск: активен ровно один контур публикации.
+#
+# Времена — местные, в timezone ниже (МСК). В yaml их нужно брать в кавычки:
+# незакавыченное 12:30 YAML 1.1 распарсит как число 750.
+
+timezone: "Europe/Moscow"
+
+persona: |
+  Ты — редактор канала для читателей старшего возраста в Санкт-Петербурге
+  и Ленинградской области. Говори уважительно и тепло, на «вы», простыми
+  словами: без сленга, англицизмов и иронии. Регион — контекст читателя:
+  северо-запад, короткий дачный сезон; не давай «южных» советов.
+
+image_style: |
+  Единый стиль картинок канала: тёплые цвета, крупные элементы, высокий
+  контраст, без мелкого текста.
+
+targets:
+  # Боевой канал: id берётся из env деплоя, в git не попадает.
+  main:
+    channel_id_env: MAX_CHANNEL_ID
+  # Тестовый target для обкатки (план §14, Этап 1): раскомментировать
+  # отдельной записью с channel_id_env: MAX_TEST_CHANNEL_ID и указать её
+  # в рубрике smoke_test (target: test); по умолчанию обкатка идёт через
+  # dry-run (превью админам), боевой канал не затрагивается.
+  # test:
+  #   channel_id_env: MAX_TEST_CHANNEL_ID
+
+daily_cap: 6
+
+# Ежедневная сводка админам одним сообщением (§11): что вышло, что пропущено
+# и почему, резервы банка, расходы на LLM. Фиксированный слот после последнего
+# поста сетки (21:30). Время местное, в кавычках — как времена рубрик.
+summary_time: "22:40"
+
+weather:
+  # СПб первым — основная точка: упал Петербург, слот пропускается (§4);
+  # дальше шесть городов области в подтверждённом порядке. Координаты
+  # задают и «Кировск Лен. обл.», чтобы не путать с Мурманской областью.
+  points:
+    - name: "Санкт-Петербург"
+      latitude: 59.9386
+      longitude: 30.3141
+    - name: "Гатчина"
+      latitude: 59.5680
+      longitude: 30.1285
+    - name: "Выборг"
+      latitude: 60.7104
+      longitude: 28.7519
+    - name: "Тихвин"
+      latitude: 59.6455
+      longitude: 33.5222
+    - name: "Луга"
+      latitude: 58.7372
+      longitude: 29.8458
+    - name: "Кингисепп"
+      latitude: 59.3733
+      longitude: 28.6136
+    - name: "Кировск (Лен. обл.)"
+      latitude: 59.8833
+      longitude: 30.9833
+
+rubrics:
+  # ~07:00, ежедневно, банк открыток и фраз, с картинкой.
+  - id: good_morning
+    enabled: true
+    time: "07:00"
+    days: [mon, tue, wed, thu, fri, sat, sun]
+    grace_minutes: 60
+    jitter_minutes: 5
+    kind: bank
+    target: main
+    source:
+      bank_types: [postcard, phrase]
+    min_chars: 200
+    max_chars: 1000
+    image: postcard
+    history_n: 7
+    similarity_threshold: 0.7
+    validators: [length, cliches]
+    on_llm_failure: bank
+
+  # ~07:05, ежедневно, шаблонный прогноз по точкам из weather.points.
+  # jitter ограничен 2 минутами: пост погоды не должен опередить «Доброе утро»
+  # (§2). Резервный пост для погоды не используется — только пропуск (§4).
+  - id: weather
+    enabled: true
+    time: "07:05"
+    days: [mon, tue, wed, thu, fri, sat, sun]
+    grace_minutes: 30
+    jitter_minutes: 2
+    kind: weather
+    target: main
+    min_chars: 200
+    max_chars: 4000
+    history_n: 3
+    similarity_threshold: 0.7
+    validators: [length, plausibility, numbers_match]
+    on_llm_failure: skip
+
+  # ~12:00, пн–сб: тема дня из банка тем и календаря (§2).
+  - id: topic_day
+    enabled: true
+    time: "12:00"
+    days: [mon, tue, wed, thu, fri, sat]
+    grace_minutes: 30
+    jitter_minutes: 10
+    kind: generative
+    target: main
+    source:
+      # Порядок значим: типы пробуются по порядку, побеждает первый с
+      # непустым отбором. «event» (факт «в этот день» по event_date)
+      # стоит перед «fact», чтобы в свой день календарь выигрывал у
+      # общей ротации фактов.
+      bank_types: [event, fact]
+    topics_by_weekday:
+      mon: "Здоровье и бодрость: общие советы, без лечения и дозировок."
+      tue: "Безопасность: мошенники, звонки, СМС — описывать с защитой, не как инструкцию."
+      wed: "Дача и сезонные дела северо-запада."
+      thu: "Технологии простым языком: смартфон, мессенджер, Госуслуги."
+      fri: "История, культура, «в этот день»."
+      sat: "Кулинария, семья, мягкий юмор."
+    prompt_overlay: |
+      Тема дня задана отдельно — раскрой её коротким текстом для читателя
+      старшего возраста, без расширения списка тем.
+    min_chars: 400
+    max_chars: 1500
+    history_n: 5
+    similarity_threshold: 0.7
+    validators: [length, cliches, numbers_match]
+    on_llm_failure: bank
+
+  # ~15:30, пн–сб: второй пост — ротация рецепт/совет/вопрос/факт (§2).
+  - id: second_post
+    enabled: true
+    time: "15:30"
+    days: [mon, tue, wed, thu, fri, sat]
+    grace_minutes: 30
+    jitter_minutes: 10
+    kind: bank
+    target: main
+    source:
+      bank_types: [recipe, advice, question, fact]
+      rotation: true
+    min_chars: 200
+    max_chars: 1200
+    history_n: 7
+    similarity_threshold: 0.7
+    validators: [length, cliches]
+    on_llm_failure: bank
+
+  # ~19:00, ежедневно: хорошие новости из федеральных мягких RSS (§5).
+  # Список лент подтверждён оператором в news_sources.yaml (Этап 0).
+  - id: good_news
+    enabled: true
+    time: "19:00"
+    days: [mon, tue, wed, thu, fri, sat, sun]
+    grace_minutes: 20
+    jitter_minutes: 10
+    kind: digest
+    target: main
+    source:
+      feeds_file: news_sources.yaml
+    min_chars: 400
+    max_chars: 3500
+    history_n: 5
+    similarity_threshold: 0.7
+    validators: [length, links_required, numbers_match]
+    # при деградации выпуск заменяется фактом дня из банка (§5), не пропуском
+    on_llm_failure: bank
+
+  # ~21:30, ежедневно: спокойной ночи + мысль из банка (§2).
+  - id: good_night
+    enabled: true
+    time: "21:30"
+    days: [mon, tue, wed, thu, fri, sat, sun]
+    grace_minutes: 60
+    jitter_minutes: 5
+    kind: generative
+    target: main
+    source:
+      bank_types: [thought]
+    prompt_overlay: |
+      Заверши пост короткой мыслью или афоризмом; классика и пословицы —
+      только с авторством из банка, своих цитат не добавляй.
+    min_chars: 200
+    max_chars: 1200
+    image: postcard
+    history_n: 7
+    similarity_threshold: 0.7
+    validators: [length, cliches]
+    on_llm_failure: bank
+
+  # Рубрика-заглушка для обкатки контура (план §14, Этап 1): один слот в
+  # день проходит весь цикл — захват slot_runs, отбор из банка, публикация,
+  # сводка — без LLM и внешних источников. По умолчанию выключена: сетка §2
+  # — шесть слотов при daily_cap 6, и седьмой включённый слот в боевые дни
+  # срезался бы капой (терялась ночная рубрика). Для обкатки включить на
+  # время: dry-run превью (RUBRICS_DRY_RUN, по умолчанию true: превью идёт
+  # админам из ADMIN_IDS, боевой канал не затрагивается) daily_cap не
+  # расходуют; для проверки доставки в закрытый канал — выключить dry-run
+  # и/или перевести на target: test. Требует хотя бы одной одобренной
+  # записи банка типов smoke/fact (импорт Этапа 0), иначе слот честно
+  # падает с алертом. Убрать после обкатки.
+  - id: smoke_test
+    enabled: false
+    time: "10:07"
+    days: [mon, tue, wed, thu, fri, sat, sun]
+    grace_minutes: 60
+    jitter_minutes: 0
+    kind: bank
+    target: main
+    source:
+      bank_types: [smoke, fact]
+    min_chars: 50
+    max_chars: 1200
+    history_n: 3
+    similarity_threshold: 0.7
+    validators: [length]
+    on_llm_failure: bank

@@ -8,6 +8,8 @@ import yaml
 from dotenv import load_dotenv
 import os
 
+from max_news_bot.config.rubrics import LLM_KINDS, RubricsConfig, load_rubrics_config
+
 
 @dataclass(frozen=True)
 class SourceConfig:
@@ -74,6 +76,7 @@ class AppConfig:
     sources: list[SourceConfig]
     data_path: Path
     factory: FactoryConfig
+    rubrics: RubricsConfig
 
 
 def _env_int(name: str, default: int) -> int:
@@ -248,6 +251,37 @@ def load_config() -> AppConfig:
             "(previews are delivered to admins)"
         )
 
+    # The rubrics contour validates its yaml even while disabled, so a typo
+    # surfaces on the deploy restart instead of at the 07:00 cutover post.
+    rubrics = load_rubrics_config()
+    if rubrics.enabled and factory.enabled:
+        raise ValueError(
+            "Conflicting publishing contours: RUBRICS_ENABLED=true starts "
+            "the rubrics scheduler while the legacy factory loop is enabled "
+            "(FACTORY_ENABLED=true); exactly one publishing contour may be "
+            "active - disable one of them"
+        )
+    if rubrics.enabled:
+        enabled_rubrics = [item for item in rubrics.rubrics if item.enabled]
+        if not enabled_rubrics:
+            raise ValueError(
+                "RUBRICS_ENABLED=true but rubrics.yaml defines no enabled rubrics"
+            )
+        if (
+            any(item.kind in LLM_KINDS for item in enabled_rubrics)
+            and not factory.llm.api_key
+        ):
+            raise ValueError(
+                "LLM_API_KEY is required when rubrics of LLM kinds "
+                f"({', '.join(LLM_KINDS)}) are enabled"
+            )
+        if rubrics.dry_run and not admin_ids:
+            raise ValueError(
+                "ADMIN_IDS is required when the rubrics contour is in dry-run "
+                "(previews are delivered to admins); set ADMIN_IDS or "
+                "RUBRICS_DRY_RUN=false"
+            )
+
     data_env = os.getenv("DATABASE_PATH", "").strip()
     if data_env:
         data_path = Path(data_env)
@@ -264,4 +298,5 @@ def load_config() -> AppConfig:
         sources=_parse_sources(sources),
         data_path=data_path,
         factory=factory,
+        rubrics=rubrics,
     )

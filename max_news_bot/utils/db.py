@@ -155,10 +155,137 @@ def _migrate_v3(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migrate_v4(conn: sqlite3.Connection) -> None:
+    """Autonomous-channel tables (plan §9): slot_runs, digest_items,
+    rubric_state, content_bank (§6) and filter_log.
+
+    slot_runs.slot_date is a calendar date computed by the scheduler in the
+    config timezone (Europe/Moscow) and stored as 'YYYY-MM-DD' — a UTC date
+    would invent duplicates/misses for near-midnight slots and on DST hops.
+    All timestamps stay UTC, as everywhere else in this database. Existing
+    tables are not touched.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS slot_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rubric_id TEXT NOT NULL,
+            slot_date TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN (
+                    'pending', 'generated', 'publishing', 'published',
+                    'skipped', 'failed', 'unknown_delivery'
+                )),
+            skip_reason TEXT,
+            error TEXT,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            target TEXT,
+            is_dry_run INTEGER NOT NULL DEFAULT 0,
+            text TEXT,
+            image_ref TEXT,
+            source_refs TEXT,
+            max_message_id TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            published_at TIMESTAMP,
+            UNIQUE (rubric_id, slot_date)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_slot_runs_status ON slot_runs (status)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_slot_runs_slot_date
+        ON slot_runs (slot_date)
+        """
+    )
+    # which news items went into which digest issue
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS digest_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slot_run_id INTEGER NOT NULL REFERENCES slot_runs(id),
+            url TEXT NOT NULL,
+            source TEXT NOT NULL,
+            title TEXT NOT NULL,
+            position INTEGER NOT NULL DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (slot_run_id, url)
+        )
+        """
+    )
+    # rubric pauses and target overrides surviving a restart
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS rubric_state (
+            rubric_id TEXT PRIMARY KEY,
+            paused INTEGER NOT NULL DEFAULT 0,
+            target TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    # content bank (plan §6): type, text, metadata, review status, show
+    # counters; months is a JSON array of month numbers (seasonality),
+    # event_date is 'MM-DD' for "this day in history" facts
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS content_bank (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_type TEXT NOT NULL,
+            text TEXT NOT NULL,
+            metadata TEXT,
+            review_status TEXT NOT NULL DEFAULT 'pending'
+                CHECK (review_status IN ('pending', 'approved', 'rejected')),
+            show_count INTEGER NOT NULL DEFAULT 0,
+            last_shown_at TIMESTAMP,
+            months TEXT,
+            event_date TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (item_type, text)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_content_bank_type
+        ON content_bank (item_type)
+        """
+    )
+    # filter chain decisions: classifier and checker LLM answers, rejection
+    # reasons (transparency mode reads them back for the daily summary)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS filter_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            stage TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            url TEXT,
+            title TEXT,
+            reason TEXT,
+            model TEXT,
+            response TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_filter_log_created
+        ON filter_log (created_at)
+        """
+    )
+
+
 _MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _migrate_v1,
     _migrate_v2,
     _migrate_v3,
+    _migrate_v4,
 ]
 
 
@@ -199,6 +326,11 @@ def _row_to_post(row: sqlite3.Row) -> Post:
 class Database:
     def __init__(self, path: Path) -> None:
         self._path = path
+
+    @property
+    def path(self) -> Path:
+        """Database file path (repositories are built over the same file)."""
+        return self._path
 
     async def initialize(self) -> None:
         await asyncio.to_thread(self._initialize_sync)

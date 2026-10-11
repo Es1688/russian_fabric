@@ -77,7 +77,7 @@ async def test_get_daily_stats(db: Database) -> None:
 
 @pytest.mark.asyncio
 async def test_migrations_from_scratch(db: Database, app_config: AppConfig) -> None:
-    assert _user_version(app_config.data_path) == 3
+    assert _user_version(app_config.data_path) == 4
 
     with sqlite3.connect(app_config.data_path) as conn:
         tables = {
@@ -103,7 +103,7 @@ async def test_initialize_is_idempotent(db: Database, app_config: AppConfig) -> 
     await db.initialize()
     await db.initialize()
 
-    assert _user_version(app_config.data_path) == 3
+    assert _user_version(app_config.data_path) == 4
     backups = list(app_config.data_path.parent.glob("*.bak-*"))
     assert backups == []
 
@@ -134,7 +134,7 @@ async def test_migrations_over_legacy_db(app_config: AppConfig) -> None:
     database = Database(path)
     await database.initialize()
 
-    assert _user_version(path) == 3
+    assert _user_version(path) == 4
     assert await database.is_sent("https://example.com/legacy") is True
     assert await database.is_post_written("https://example.com/whatever") is False
 
@@ -190,7 +190,7 @@ async def test_migrate_v3_message_id_int_to_text(app_config: AppConfig) -> None:
     database = Database(path)
     await database.initialize()
 
-    assert _user_version(path) == 3
+    assert _user_version(path) == 4
     posts = await database.get_recent_posts(10)
     assert len(posts) == 2
     by_url = {post.news_url: post for post in posts}
@@ -313,7 +313,7 @@ async def test_migrate_v3_recovers_from_dangling_posts_new(
     database = Database(path)
     await database.initialize()  # must not raise
 
-    assert _user_version(path) == 3
+    assert _user_version(path) == 4
     posts = await database.get_recent_posts(10)
     assert [post.message_id for post in posts] == ["4242"]
 
@@ -336,6 +336,96 @@ async def test_migrate_v3_preserves_autoincrement_counter(
 
     posts = await database.get_recent_posts(10)
     assert sorted(post.id for post in posts)[-1] == 1000
+
+
+_V4_TABLES = ("slot_runs", "digest_items", "rubric_state", "content_bank", "filter_log")
+
+
+async def _make_v3_db(path) -> None:
+    """A production-shaped v3 database: full v3 schema with data, no v4 tables."""
+    await Database(path).initialize()
+    with sqlite3.connect(path) as conn:
+        for table in _V4_TABLES:
+            conn.execute(f"DROP TABLE {table}")
+        conn.execute(
+            "INSERT INTO sent_news (url, source, title) VALUES (?, ?, ?)",
+            ("https://example.com/keep", "Habr", "Kept news"),
+        )
+        conn.execute("PRAGMA user_version = 3")
+        conn.commit()
+
+
+@pytest.mark.asyncio
+async def test_migrate_v4_from_v3(app_config: AppConfig) -> None:
+    path = app_config.data_path
+    await _make_v3_db(path)
+
+    database = Database(path)
+    await database.initialize()
+
+    assert _user_version(path) == 4
+    # pre-existing data and tables survived
+    assert await database.is_sent("https://example.com/keep") is True
+    with sqlite3.connect(path) as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    assert set(_V4_TABLES) <= tables
+    assert {"sent_news", "bot_stats", "sources_state", "posts"} <= tables
+
+    # safety copy of the v3 file was made before upgrading
+    backups = list(path.parent.glob(f"{path.name}.bak-v3"))
+    assert len(backups) == 1
+
+
+@pytest.mark.asyncio
+async def test_migrate_v4_slot_runs_constraints(app_config: AppConfig) -> None:
+    path = app_config.data_path
+    await _make_v3_db(path)
+    await Database(path).initialize()
+
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            INSERT INTO slot_runs (rubric_id, slot_date)
+            VALUES ('good_morning', '2026-10-09')
+            """
+        )
+        conn.commit()
+        # UNIQUE(rubric_id, slot_date): one rubric slot per day
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                """
+                INSERT INTO slot_runs (rubric_id, slot_date)
+                VALUES ('good_morning', '2026-10-09')
+                """
+            )
+        # the same rubric on another date is a different slot
+        conn.execute(
+            """
+            INSERT INTO slot_runs (rubric_id, slot_date)
+            VALUES ('good_morning', '2026-10-10')
+            """
+        )
+        # status vocabulary is checked by the database
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                """
+                INSERT INTO slot_runs (rubric_id, slot_date, status)
+                VALUES ('weather', '2026-10-09', 'exploded')
+                """
+            )
+        # default status is pending, timestamps default to UTC now
+        row = conn.execute(
+            """
+            SELECT status, created_at, updated_at FROM slot_runs WHERE id = 1
+            """
+        ).fetchone()
+        assert row[0] == "pending"
+        assert row[1] is not None and row[2] is not None
 
 
 @pytest.mark.asyncio

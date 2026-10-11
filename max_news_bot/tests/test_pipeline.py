@@ -87,6 +87,7 @@ async def test_filter_excludes_items_before_publish(
         sources=app_config.sources,
         data_path=app_config.data_path,
         factory=app_config.factory,
+        rubrics=app_config.rubrics,
     )
     fetcher = MockFetcher(items=items)
     publisher = MockPublisher(success=True)

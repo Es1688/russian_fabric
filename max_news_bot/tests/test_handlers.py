@@ -281,6 +281,15 @@ async def test_factory_run_allowed_for_admin(factory_setup) -> None:
     assert any("Factory cycle done:" in text for text in texts)
 
 
+async def test_factory_bare_command_still_runs_factory_cycle(factory_setup) -> None:
+    # backward compatibility: /factory without arguments equals /factory run
+    await _invoke(factory_setup, "/factory", user_id=factory_setup.app_config.admin_ids[0])
+
+    texts = _texts(factory_setup)
+    assert "Running factory cycle..." in texts
+    assert any("Factory cycle done:" in text for text in texts)
+
+
 async def test_factory_run_reports_disabled_when_no_factory(handler_setup) -> None:
     await _invoke(handler_setup, "/factory run", user_id=handler_setup.app_config.admin_ids[0])
 
@@ -338,7 +347,26 @@ async def test_factory_usage_hint_on_unknown_action(factory_setup) -> None:
         factory_setup, "/factory frobnicate", user_id=factory_setup.app_config.admin_ids[0]
     )
 
-    assert any("Usage: /factory" in text for text in _texts(factory_setup))
+    hint = _texts(factory_setup)[0]
+    assert "Usage: /factory" in hint
+    # the hint documents the rubric argument (plan section 11); angle
+    # brackets are html-escaped because replies go as fmt=html
+    assert "[all|&lt;rubric&gt;]" in hint
+    assert "/factory retract slot &lt;run_id&gt;" in hint
+
+
+async def test_factory_rubric_argument_answers_disabled_without_contour(
+    factory_setup,
+) -> None:
+    await _invoke(
+        factory_setup,
+        "/factory pause weather",
+        user_id=factory_setup.app_config.admin_ids[0],
+    )
+
+    assert _texts(factory_setup) == [
+        "Rubrics contour is disabled (check RUBRICS_ENABLED)."
+    ]
 
 
 async def test_factory_retract_deletes_channel_message(factory_setup) -> None:

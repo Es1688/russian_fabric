@@ -46,6 +46,24 @@ _REFUSAL_PHRASES: tuple[str, ...] = (
     "я всего лишь ии",
 )
 
+# Cliché filler phrases (plan section 3 anti-repeat): tired wording the
+# rubric validators reject in generated posts. Substring match,
+# case-insensitive, "ё" folded to "е" on both sides.
+_CLICHE_PHRASES: tuple[str, ...] = (
+    "как говорится",
+    "как известно",
+    "ни для кого не секрет",
+    "не для кого не секрет",
+    "не секрет, что",
+    "само собой разумеется",
+    "так сказать",
+    "что и требовалось доказать",
+    "в наше непростое время",
+    "в наше сложное время",
+    "век живи — век учись",
+    "век живи - век учись",
+)
+
 
 def validate_post_text(
     text: str, *, max_chars: int, min_chars: int
@@ -91,5 +109,15 @@ def find_refusal_phrase(text: str) -> str | None:
     normalized = text.replace("\u2019", "'").replace("\u2018", "'").lower()
     for phrase in _REFUSAL_PHRASES:
         if phrase in normalized:
+            return phrase
+    return None
+
+
+def find_cliche_phrase(text: str) -> str | None:
+    """Return the first cliché filler phrase found in the text, or None."""
+    normalized = text.replace("\u2019", "'").replace("\u2018", "'").lower()
+    normalized = normalized.replace("ё", "е")
+    for phrase in _CLICHE_PHRASES:
+        if phrase.replace("ё", "е") in normalized:
             return phrase
     return None

@@ -23,6 +23,10 @@ def env_vars(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("FACTORY_INTERVAL_HOURS", raising=False)
     monkeypatch.delenv("LLM_BASE_URL", raising=False)
     monkeypatch.delenv("LLM_MODEL", raising=False)
+    # the rubrics contour is off in every loader test; a developer's real
+    # .env must not flip it on and turn loading into a contour conflict
+    monkeypatch.delenv("RUBRICS_ENABLED", raising=False)
+    monkeypatch.delenv("RUBRICS_CONFIG_PATH", raising=False)
 
 
 def test_load_config_reads_yaml(env_vars: None) -> None:
@@ -112,6 +116,14 @@ def test_empty_sources_yaml(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "max_news_bot.config.loader.yaml.safe_load",
         lambda _content: {"settings": {}, "filters": {}, "sources": []},
+    )
+    # the safe_load patch hits the shared yaml module, so the rubrics loader
+    # would see this fake dict too: bypass it with a contour-off config
+    from max_news_bot.config.rubrics import empty_rubrics_config
+
+    monkeypatch.setattr(
+        "max_news_bot.config.loader.load_rubrics_config",
+        lambda *args, **kwargs: empty_rubrics_config(),
     )
 
     config = load_config()
