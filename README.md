@@ -166,6 +166,27 @@ uv run pytest                                    # тесты
 3. **Прод**: `RUBRICS_DRY_RUN=false`, банк контента наполнен (блокирует старт
    тестовой недели, не разработку).
 
+### Наполнение банка контента
+
+Банк — таблица `content_bank`; импорт — `scripts/bank_import.py` из
+seed-файла YAML (формат и пример — [docs/bank-seed.example.yaml](docs/bank-seed.example.yaml)).
+Записи импортируются как `approved` (тексты проверяются до импорта;
+`--pending` — отложить на ревью), повторный импорт того же файла идемпотентен;
+после импорта печатается запас по каждому типу (порог алерта — 30).
+
+```bash
+# локальная проверка seed-файла без записи в БД
+uv run python -m max_news_bot.scripts.bank_import --file seed.yaml --dry-run
+
+# на VPS: положить seed-файл в data-каталог (смонтирован в /app/data)
+docker exec maxnewsbot python /app/max_news_bot/scripts/bank_import.py \
+    --file /app/data/bank_seed.yaml
+```
+
+Открытки (тип `postcard`) требуют файл изображения в каталоге `postcards`
+data-каталога (VPS: `/opt/maxnewsbot/data/postcards/`); импорт сверяет
+существование файла.
+
 ## Контент-фабрика (legacy)
 
 Второй, независимый от дайджеста цикл: отбор новостей по своим ключевым словам →
