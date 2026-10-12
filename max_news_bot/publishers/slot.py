@@ -165,7 +165,10 @@ class MaxSlotPublisher:
         delivered = 0
         for admin_id in self._admin_ids:
             try:
-                await self._send_with_retries(admin_id, preview, attachments)
+                # admin_ids hold user_id: DMs are addressed by user_id
+                await self._send_with_retries(
+                    None, preview, attachments, user_id=admin_id
+                )
                 delivered += 1
             except asyncio.CancelledError:
                 raise
@@ -184,19 +187,24 @@ class MaxSlotPublisher:
 
     async def _send_with_retries(
         self,
-        chat_id: int,
+        chat_id: int | None,
         message: str,
         attachments: list[dict[str, Any]] | None,
+        *,
+        user_id: int | None = None,
     ) -> str:
         """send_message with rate-limit and attachment.not.ready retries.
 
         The not-ready loop wraps the rate-limit loop: each not-ready retry
         re-sends the SAME message with the SAME token - the file keeps
-        processing server-side, no re-upload is needed."""
+        processing server-side, no re-upload is needed. Addressing passes
+        through to the client: channel by chat_id, admin DMs by user_id."""
         not_ready = 0
         while True:
             try:
-                return await self._send_rate_limited(chat_id, message, attachments)
+                return await self._send_rate_limited(
+                    chat_id, message, attachments, user_id=user_id
+                )
             except MaxApiError as exc:
                 if (
                     not is_attachment_not_ready(exc)
@@ -216,16 +224,22 @@ class MaxSlotPublisher:
 
     async def _send_rate_limited(
         self,
-        chat_id: int,
+        chat_id: int | None,
         message: str,
         attachments: list[dict[str, Any]] | None,
+        *,
+        user_id: int | None = None,
     ) -> str:
         for attempt in range(1, _MAX_SEND_ATTEMPTS + 1):
             if self._sends > 0:
                 await asyncio.sleep(self.SEND_PAUSE_SECONDS)
             try:
                 mid = await self._client.send_message(
-                    chat_id, message, fmt="html", attachments=attachments
+                    chat_id,
+                    message,
+                    user_id=user_id,
+                    fmt="html",
+                    attachments=attachments,
                 )
                 self._sends += 1
                 return mid

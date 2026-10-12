@@ -42,19 +42,29 @@ class MaxClient:
 
     async def send_message(
         self,
-        chat_id: int,
-        text: str,
+        chat_id: int | None = None,
+        text: str = "",
         *,
+        user_id: int | None = None,
         fmt: str = "html",
         disable_link_preview: bool = False,
         attachments: list[dict[str, Any]] | None = None,
     ) -> str:
         """POST /messages; returns the created message id (mid).
 
-        mid is a string like "mid.<id>", not an int. ``attachments`` is the
-        raw MAX attachments array, e.g.
+        Exactly one of chat_id (group chat/channel) and user_id (direct
+        dialog with a user) must be given, ValueError otherwise: the API
+        silently prefers user_id when both are sent, so ambiguity is
+        rejected here. mid is a string like "mid.<id>", not an int.
+        ``attachments`` is the raw MAX attachments array, e.g.
         [{"type": "image", "payload": {"token": "<mediafile_token>"}}]."""
-        params: dict[str, Any] = {"chat_id": chat_id}
+        if (chat_id is None) == (user_id is None):
+            raise ValueError(
+                "send_message requires exactly one of chat_id / user_id"
+            )
+        params: dict[str, Any] = (
+            {"user_id": user_id} if user_id is not None else {"chat_id": chat_id}
+        )
         if disable_link_preview:
             params["disable_link_preview"] = "true"
         message: dict[str, Any] = {"text": text, "format": fmt, "notify": True}

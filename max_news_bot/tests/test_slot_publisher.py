@@ -397,10 +397,12 @@ async def test_dry_run_previews_to_admins_with_card(
 
     assert result.success and result.message_id is None
     attempts = server.messages_requests()
-    assert [entry["query"]["chat_id"] for entry in attempts] == [
+    # admin_ids hold user_id: DMs are addressed by user_id, no chat_id
+    assert [entry["query"]["user_id"] for entry in attempts] == [
         str(admin) for admin in _ADMINS
     ]
     for entry in attempts:
+        assert "chat_id" not in entry["query"]
         assert entry["json"]["text"].startswith("[DRY-RUN] ")
         assert entry["json"]["attachments"][0]["payload"]["token"] == (
             _MEDIAFILE_TOKEN

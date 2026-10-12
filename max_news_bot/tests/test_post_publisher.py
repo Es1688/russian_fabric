@@ -229,9 +229,11 @@ async def test_admins_mode_sends_preview_to_every_admin() -> None:
     # dry-run previews carry no channel message id
     assert result.message_id is None
     assert client.send_message.await_count == len(_ADMINS)
-    sent_to = [call_args(client, i)[0] for i in range(len(_ADMINS))]
+    # admin_ids hold user_id: DMs are addressed by user_id, no chat_id
+    sent_to = [call_kwargs(client, i)["user_id"] for i in range(len(_ADMINS))]
     assert sent_to == _ADMINS
     for i in range(len(_ADMINS)):
+        assert call_args(client, i)[0] is None
         text = call_args(client, i)[1]
         assert text.startswith("[DRY-RUN] ")
         assert text.endswith(f"\nИсточник: {_NEWS_URL}")

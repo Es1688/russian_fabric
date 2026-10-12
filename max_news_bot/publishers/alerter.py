@@ -37,6 +37,10 @@ class MaxAlerter:
     async def _broadcast(self, text: str) -> None:
         for admin_id in self._admin_ids:
             try:
-                await self._client.send_message(admin_id, text, fmt="html")
+                # admin_ids hold user_id: a DM is addressed by user_id,
+                # chat_id would make the API look for a group chat
+                await self._client.send_message(
+                    text=text, user_id=admin_id, fmt="html"
+                )
             except Exception as exc:
                 logger.error("alert_delivery_failed admin_id=%s error=%s", admin_id, exc)

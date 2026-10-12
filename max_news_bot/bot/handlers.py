@@ -35,7 +35,7 @@ _START_TEXT = (
 # Registered via PATCH /me/commands at startup (best-effort).
 BOT_COMMANDS: list[dict] = [
     {"name": "start", "description": "Приветствие и подписка на личные сообщения"},
-    {"name": "chatid", "description": "Показать chat_id этого чата"},
+    {"name": "chatid", "description": "Показать chat_id чата и user_id отправителя"},
     {"name": "status", "description": "Состояние бота"},
     {"name": "sources", "description": "Список RSS-источников"},
     {"name": "stats", "description": "Статистика по дням"},
@@ -83,8 +83,14 @@ def create_dispatcher(
             return
 
         if command == "chatid":
-            # setup helper: tells the admin the chat_id to put in MAX_CHANNEL_ID
-            await reply(chat_id, f"chat_id: {chat_id}")
+            # setup helper: chat_id goes to MAX_CHANNEL_ID, the sender's
+            # user_id goes to ADMIN_IDS (DMs are addressed by user_id)
+            user_part = str(user_id) if user_id is not None else "unknown"
+            await reply(
+                chat_id,
+                f"chat_id: {chat_id} (MAX_CHANNEL_ID)\n"
+                f"user_id: {user_part} (ADMIN_IDS)",
+            )
             return
 
         if command == "status":
@@ -132,6 +138,12 @@ def create_dispatcher(
 
         if command == "news":
             if not is_admin(user_id):
+                logger.info(
+                    "access_denied chat_id=%s user_id=%s command=%s",
+                    chat_id,
+                    user_id,
+                    command,
+                )
                 await reply(chat_id, "Access denied.")
                 return
             async with publish_lock:
@@ -146,6 +158,12 @@ def create_dispatcher(
 
         if command == "factory":
             if not is_admin(user_id):
+                logger.info(
+                    "access_denied chat_id=%s user_id=%s command=%s",
+                    chat_id,
+                    user_id,
+                    command,
+                )
                 await reply(chat_id, "Access denied.")
                 return
             await dispatch_factory(chat_id, args)
@@ -153,6 +171,12 @@ def create_dispatcher(
 
         if command == "posts":
             if not is_admin(user_id):
+                logger.info(
+                    "access_denied chat_id=%s user_id=%s command=%s",
+                    chat_id,
+                    user_id,
+                    command,
+                )
                 await reply(chat_id, "Access denied.")
                 return
             posts = await db.get_recent_posts(_RECENT_POSTS_LIMIT)

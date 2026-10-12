@@ -107,7 +107,8 @@ class MaxPostPublisher:
         delivered = 0
         for admin_id in self._admin_ids:
             try:
-                await self._send_with_retries(admin_id, message)
+                # admin_ids hold user_id: DMs are addressed by user_id
+                await self._send_with_retries(None, message, user_id=admin_id)
                 delivered += 1
             except Exception as exc:
                 # one admin failing must not block the other previews
@@ -124,15 +125,27 @@ class MaxPostPublisher:
         )
 
     async def _send_with_retries(
-        self, chat_id: int, message: str, *, fmt: str = "html"
+        self,
+        chat_id: int | None,
+        message: str,
+        *,
+        user_id: int | None = None,
+        fmt: str = "html",
     ) -> str:
-        """send_message with rate-limit retry; returns the mid string."""
+        """send_message with rate-limit retry; returns the mid string.
+
+        Addressing passes through to the client: channel posts by chat_id,
+        admin DMs by user_id (exactly one of them, the client validates)."""
         for attempt in range(1, _MAX_SEND_ATTEMPTS + 1):
             if self._sends > 0:
                 await asyncio.sleep(self.SEND_PAUSE_SECONDS)
             try:
                 mid = await self._client.send_message(
-                    chat_id, message, fmt=fmt, disable_link_preview=False
+                    chat_id,
+                    message,
+                    user_id=user_id,
+                    fmt=fmt,
+                    disable_link_preview=False,
                 )
                 self._sends += 1
                 return mid

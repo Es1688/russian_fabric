@@ -149,6 +149,33 @@ async def test_send_message_format_and_link_preview_params(max_server) -> None:
     assert request["json"]["notify"] is True
 
 
+async def test_send_message_user_id_targets_direct_dialog(max_server) -> None:
+    server, base_url = max_server
+
+    await make_client(base_url).send_message(text="Личное", user_id=777)
+
+    request = server.requests[-1]
+    assert request["query"]["user_id"] == "777"
+    # a DM must never carry chat_id: the API would look for a group chat
+    assert "chat_id" not in request["query"]
+    assert request["json"] == {"text": "Личное", "format": "html", "notify": True}
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        # both addresses: the API would silently prefer user_id
+        {"chat_id": _CHAT_ID, "text": "x", "user_id": 777},
+        # no address at all
+        {"text": "x"},
+    ],
+)
+async def test_send_message_rejects_ambiguous_addressing(kwargs: dict) -> None:
+    # validation fires before any request: no server needed
+    with pytest.raises(ValueError):
+        await MaxClient(token=_TOKEN, session=None).send_message(**kwargs)
+
+
 @pytest.mark.parametrize(
     ("payload", "expected_mid"),
     [

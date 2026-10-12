@@ -198,13 +198,17 @@ async def test_bot_started_replies_greeting(handler_setup) -> None:
     assert "Привет" in handler_setup.client.sent[0][1]
 
 
-async def test_chatid_replies_with_current_chat_id(handler_setup) -> None:
-    await _invoke(handler_setup, "/chatid", chat_id=-777000111)
+async def test_chatid_replies_with_chat_id_and_user_id(handler_setup) -> None:
+    await _invoke(handler_setup, "/chatid", chat_id=-777000111, user_id=555000)
 
     assert len(handler_setup.client.sent) == 1
     chat_id, text, _ = handler_setup.client.sent[0]
     assert chat_id == -777000111
-    assert str(-777000111) in text
+    # both ids, with the config variable each one belongs to
+    assert "chat_id: -777000111" in text
+    assert "MAX_CHANNEL_ID" in text
+    assert "user_id: 555000" in text
+    assert "ADMIN_IDS" in text
 
 
 # --- /news --------------------------------------------------------------------
