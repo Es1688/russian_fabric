@@ -4,7 +4,10 @@ End-to-end against a local mock MAX server: the postcard flow
 (/uploads -> CDN multipart upload -> /messages with the attachment
 token), degradation rules (a broken card goes text-only, a transport
 failure fails the publish as infra) and the two retry dimensions
-(rate limit, attachment.not.ready).
+(rate limit, attachment.not.ready). The generated-image branch
+(``generated:<file>`` refs, dual-channel plan §3.4) is covered by the
+same rules plus the file lifecycle: deleted after a confirmed publish,
+kept until then.
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ _CHANNEL_ID = -1001234567890
 _ADMINS = [111, 222]
 _MEDIAFILE_TOKEN = "mediafile.token.abc123"
 _IMAGE_BYTES = b"fake-jpeg-bytes"
+_GENERATED_BYTES = b"fake-png-bytes"
 
 
 class FakeSlotServer:
@@ -130,14 +134,25 @@ def postcards_dir(tmp_path: Path) -> Path:
     return cards
 
 
+@pytest.fixture
+def generated_dir(tmp_path: Path) -> Path:
+    generated = tmp_path / "generated"
+    generated.mkdir()
+    return generated
+
+
 def make_publisher(
-    base_url: str, bank: ContentBankRepository, postcards_dir: Path
+    base_url: str,
+    bank: ContentBankRepository,
+    postcards_dir: Path,
+    generated_dir: Path | None = None,
 ) -> MaxSlotPublisher:
     publisher = MaxSlotPublisher(
         MaxClient(token=_TOKEN, base_url=base_url),
         list(_ADMINS),
         bank=bank,
         postcards_dir=postcards_dir,
+        generated_dir=generated_dir,
     )
     # no real waiting in tests (rate-limit and not-ready pauses)
     publisher.SEND_PAUSE_SECONDS = 0.0
@@ -294,6 +309,119 @@ async def test_upload_transport_failure_is_infra_without_message(
     assert result.error_kind == "infra"
     # never silently send the post without its card on a transport failure
     assert server.messages_requests() == []
+
+
+# --- generated images (dual-channel plan §3.4) --------------------------------------
+
+
+async def test_publish_with_generated_image_full_flow(
+    slot_server,
+    bank: ContentBankRepository,
+    postcards_dir: Path,
+    generated_dir: Path,
+) -> None:
+    server, base_url = slot_server
+    (generated_dir / "42.png").write_bytes(_GENERATED_BYTES)
+    publisher = make_publisher(
+        base_url, bank, postcards_dir, generated_dir=generated_dir
+    )
+
+    result = await publisher.publish_slot(
+        "Утренние новости.", chat_id=_CHANNEL_ID, image_ref="generated:42.png"
+    )
+
+    assert result.success and result.message_id == "mid.700001:1"
+    uploads, cdn, message = server.requests[-3:]
+    assert uploads["path"] == "/uploads" and uploads["query"] == {"type": "image"}
+    assert b'filename="42.png"' in cdn["raw"]
+    assert b"\r\n\r\n" + _GENERATED_BYTES + b"\r\n" in cdn["raw"]
+    assert message["json"]["attachments"] == [
+        {"type": "image", "payload": {"token": _MEDIAFILE_TOKEN}}
+    ]
+
+
+async def test_generated_path_traversal_degrades_to_text_only(
+    slot_server,
+    bank: ContentBankRepository,
+    postcards_dir: Path,
+    generated_dir: Path,
+) -> None:
+    server, base_url = slot_server
+    secret = generated_dir.parent / "secret.png"
+    secret.write_bytes(b"secret-bytes")
+    publisher = make_publisher(
+        base_url, bank, postcards_dir, generated_dir=generated_dir
+    )
+
+    escaping_refs = (
+        "generated:../secret.png",
+        "generated:/etc/hostname",
+        "generated:a/b.png",
+    )
+    for ref in escaping_refs:
+        result = await publisher.publish_slot(
+            "Утренние новости.", chat_id=_CHANNEL_ID, image_ref=ref
+        )
+        assert result.success
+
+    # every rejected ref went text-only, nothing was uploaded and the
+    # file outside the generated dir is untouched
+    assert [entry["path"] for entry in server.requests] == ["/messages"] * 3
+    assert secret.read_bytes() == b"secret-bytes"
+
+
+async def test_missing_generated_file_degrades_to_text_only(
+    slot_server,
+    bank: ContentBankRepository,
+    postcards_dir: Path,
+    generated_dir: Path,
+) -> None:
+    server, base_url = slot_server
+    publisher = make_publisher(
+        base_url, bank, postcards_dir, generated_dir=generated_dir
+    )
+
+    missing = await publisher.publish_slot(
+        "Утренние новости.", chat_id=_CHANNEL_ID, image_ref="generated:999.png"
+    )
+    bad_extension = await publisher.publish_slot(
+        "Утренние новости.", chat_id=_CHANNEL_ID, image_ref="generated:notes.txt"
+    )
+
+    assert missing.success and bad_extension.success
+    assert [entry["path"] for entry in server.requests] == ["/messages"] * 2
+    assert "attachments" not in server.requests[-1]["json"]
+
+
+async def test_generated_file_deleted_after_success_kept_on_failure(
+    slot_server,
+    bank: ContentBankRepository,
+    postcards_dir: Path,
+    generated_dir: Path,
+) -> None:
+    server, base_url = slot_server
+    publisher = make_publisher(
+        base_url, bank, postcards_dir, generated_dir=generated_dir
+    )
+    (generated_dir / "7.png").write_bytes(_GENERATED_BYTES)
+
+    result = await publisher.publish_slot(
+        "Утренние новости.", chat_id=_CHANNEL_ID, image_ref="generated:7.png"
+    )
+
+    assert result.success
+    assert not (generated_dir / "7.png").exists()
+
+    # a transport failure keeps the file on disk for the publish retry
+    server.upload_error = (502, "cdn exploded")
+    (generated_dir / "8.png").write_bytes(_GENERATED_BYTES)
+
+    failed = await publisher.publish_slot(
+        "Вечерние новости.", chat_id=_CHANNEL_ID, image_ref="generated:8.png"
+    )
+
+    assert not failed.success and failed.error_kind == "infra"
+    assert (generated_dir / "8.png").exists()
 
 
 async def test_empty_text_is_a_content_error(

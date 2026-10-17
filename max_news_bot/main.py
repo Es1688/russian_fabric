@@ -23,7 +23,10 @@ from max_news_bot.publishers.max import MaxDigestPublisher
 from max_news_bot.publishers.post import MaxPostPublisher
 from max_news_bot.utils.db import Database
 from max_news_bot.utils.logging import get_logger, setup_logging
+from max_news_bot.writers.base import Writer
+from max_news_bot.writers.fallback import FallbackWriter
 from max_news_bot.writers.llm import LlmWriter
+from max_news_bot.writers.readiness import probe_llm_channels
 
 
 logger = get_logger(__name__)
@@ -51,8 +54,10 @@ async def main() -> None:
     factory: ContentFactory | None = None
     factory_lock: asyncio.Lock | None = None
     if config.factory.enabled:
+        post_publisher = MaxPostPublisher(client, config.channel_id, config.admin_ids)
+        alerter = MaxAlerter(client, config.admin_ids)
         llm = config.factory.llm
-        writer = LlmWriter(
+        writer: Writer = LlmWriter(
             base_url=llm.base_url,
             api_key=llm.api_key,
             model=llm.model,
@@ -60,19 +65,50 @@ async def main() -> None:
             max_tokens=llm.max_tokens,
             temperature=llm.temperature,
             prompt=config.factory.prompt,
+            disable_reasoning=llm.disable_reasoning,
             session=http_session,
         )
-        post_publisher = MaxPostPublisher(client, config.channel_id, config.admin_ids)
-        alerter = MaxAlerter(client, config.admin_ids)
+        fallback_llm = config.factory.llm_fallback
+        if fallback_llm is not None:
+            # Per-request failover (dual-channel plan §2.3/§2.4): timeout /
+            # max_tokens / temperature stay the primary's, base_url / model
+            # / key / reasoning flag come from the fallback section; the
+            # alert hook reports a config error of either channel even when
+            # a successful post of the other one masks it.
+            writer = FallbackWriter(
+                writer,
+                LlmWriter(
+                    base_url=fallback_llm.base_url,
+                    api_key=fallback_llm.api_key,
+                    model=fallback_llm.model,
+                    timeout=llm.timeout,
+                    max_tokens=llm.max_tokens,
+                    temperature=llm.temperature,
+                    prompt=config.factory.prompt,
+                    disable_reasoning=fallback_llm.disable_reasoning,
+                    session=http_session,
+                ),
+                db=db,
+                alerter=alerter,
+            )
         factory = ContentFactory(config, fetcher, writer, post_publisher, alerter, db)
         factory_lock = asyncio.Lock()
+        # Readiness probe of both LLM channels before any background task
+        # starts (dual-channel plan §2.1): a config-kind failure (broken
+        # key/balance/model) aborts the launch, an infra-kind one only
+        # warns and the startup continues.
+        await probe_llm_channels(config.factory, http_session)
 
     # RUBRICS_ENABLED contour (plan sections 8 and 14): built only when
     # enabled; config validation guarantees the legacy factory loop is off
     # in that case, so no second publishing contour can appear here.
     runtime: RubricsRuntime | None = None
     if config.rubrics.enabled:
-        runtime = build_rubrics_runtime(config, db, client, http_session, fetcher)
+        # the construction's only network call is the readiness probe of
+        # the wired LLM channels (see build_rubrics_runtime docstring)
+        runtime = await build_rubrics_runtime(
+            config, db, client, http_session, fetcher
+        )
 
     handle_update = create_dispatcher(
         config,

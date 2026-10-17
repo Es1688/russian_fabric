@@ -177,6 +177,16 @@ async def test_reasoning_switch_absent_from_payload(llm_server) -> None:
     assert "reasoning" not in server.requests[0]["json"]
 
 
+async def test_disable_reasoning_flag_adds_reasoning_switch(llm_server) -> None:
+    # thinking models on OpenRouter otherwise burn the whole max_tokens
+    # budget on reasoning and return content=null
+    server, base_url = llm_server
+
+    await make_writer(base_url, disable_reasoning=True).write_post(make_item())
+
+    assert server.requests[0]["json"]["reasoning"] == {"enabled": False}
+
+
 async def test_default_prompt_contains_injection_guard_rules() -> None:
     # P0.2: facts only, no instructions from the article, no links, SKIP right
     prompt = DEFAULT_PROMPT.lower()

@@ -2,7 +2,8 @@
 
 Небольшой production-бот для сбора новостей из RSS-источников и публикации в канал мессенджера MAX.
 Проект — порт Telegram-бота content_fabric на российский стек доставки: мессенджер MAX (platform-api2.max.ru)
-и Yandex AI Studio для LLM-постов. Проект должен оставаться простым: сначала автономный MAX-бот,
+и OpenAI-совместимые LLM-провайдеры для постов — OpenRouter первичным каналом,
+Yandex AI Studio резервным (ADR-002). Проект должен оставаться простым: сначала автономный MAX-бот,
 затем аккуратное встраивание в систему фабрики контента.
 
 Главный принцип: отделить сбор и подготовку новости от способа публикации. Сегодня выходом является MAX,
@@ -76,6 +77,166 @@ OpenAI-совместимый провайдер. Обе платформы из
   постами под лимит 2 msg/sec на диалог.
 - `/factory retract` удаляет сообщение из канала по `mid`.
 - Тест архитектуры банит aiogram/aiohttp-socks в зависимостях.
+
+---
+
+## ADR-002: Двухканальный LLM — OpenRouter первичный, Yandex GPT резервный
+
+Статус: принято (план docs/plans/2026-10-14-dual-channel-llm-images.md).
+
+### Контекст и причины
+
+Единственный LLM-провайдер (Yandex AI Studio) — единая точка отказа: его авария
+останавливает и фабрику, и LLM-рубрики автономного канала. Нужен резервный
+канал, но без липкого состояния. Липкое переключение «связками» (общий флаг
+активной пары LLM+изображения, кулдауны и пробы возврата) отклонено: домены
+отказа независимы (лежащий OpenRouter не должен уводить текст на другую модель
+при живом fal), уровни критичности разные (ошибка LLM = поста нет, ошибка
+картинки = деградация до текста), а цена — состояние в БД и операционные
+сюрпризы.
+
+### Решения
+
+1. **Приоритет каналов.** Первичный — OpenRouter (`https://openrouter.ai/api/v1`,
+   модель `qwen/qwen3.8-flash`, ключ `OPENROUTER_API_KEY`); резервный —
+   Yandex AI Studio (`https://ai.api.cloud.yandex.net/v1`,
+   `gpt://<folder_id>/yandexgpt-5-lite`, существующий ключ `LLM_API_KEY`).
+   Оба — OpenAI-совместимые endpoints: `LlmWriter`/`LlmCompletionClient`
+   не меняют протокол, меняются только конфиг-дефолты. В `sources.yaml`
+   секция `factory.llm` остаётся «первичным каналом», новая
+   `factory.llm_fallback` — «резервным»; timeout/max_tokens/temperature
+   общие с первичным каналом. Резервный канал существует тогда и только
+   тогда, когда задан `LLM_API_KEY`.
+2. **Per-request failover без состояния** (`writers/fallback.py`): каждый
+   вызов начинает с первичного канала; `WriteResult` со `status="error"`
+   (любой error_kind — infra/config/content) или `LlmCompletionError` любого
+   вида переключает на резерв. Промпт один на оба канала — он
+   провайдер-агностичный. При ошибке обоих каналов возвращается результат
+   резерва с комбинированным текстом ошибки, но error_kind остаётся от
+   резерва: битый ключ Yandex корректно даёт config → автопауза фабрики.
+   В `post.llm_model` фиксируется реально отработавшая модель. Цена сбоя
+   первичного — одна неудачная попытка с таймаутом на вызов (при частоте
+   слотов незаметно).
+3. **Thinking-модели.** `LlmConfig.disable_reasoning` (дефолт первичного —
+   true): qwen иначе сжигает весь `max_tokens` на рассуждения и возвращает
+   `content=null`; при флаге в payload добавляется
+   `reasoning: {"enabled": false}`.
+4. **Fail-fast обязательности.** При активном LLM-контуре (фабрика или
+   LLM-рубрики) обязательны ОБА ключа — отсутствие любого (`OPENROUTER_API_KEY`
+   или `LLM_API_KEY`) роняет запуск в `load_config`: тихий запуск с одним
+   каналом ломает заявленную отказоустойчивость. Одиночный канал возможен
+   только вне LLM-контуров.
+5. **Readiness-проба на старте** (`writers/readiness.py`): оба подключённых
+   канала получают минимальный completion-зонд (`max_tokens=1`, короткий
+   промпт; стоимость — доли цента) до старта фоновых задач — в `main.py`
+   (фабрика) и при сборке рантайма рубрик (`bot/rubrics_runtime.py`), где он
+   — единственный сетевой вызов сборки (инвариант «construction performs no
+   network calls» сознательно пересмотрен). Исходы: 200 → канал готов;
+   config-вид (401/402/403/404 — ключ/баланс/модель) → ValueError, запуск
+   падает (статическая ошибка деплоя, а не повод ждать аварии primary);
+   infra-вид (сеть/5xx/таймаут) → WARNING, запуск продолжается — временная
+   недоступность внешнего сервиса не должна блокировать старт бота.
+   Изображения на старте не пробуются: генерация тарифицируется за запрос.
+6. **Wiring обоих контуров.** Фабрика — `FallbackWriter` в `main.py`;
+   рубрики — `FallbackCompletion` в `bot/rubrics_runtime.py::_build_completion`
+   (одним местом покрывает generative/bank/digest-рубрики); общая
+   `aiohttp.ClientSession`.
+7. **Наблюдаемость.** Каждый вызов пишет durable-событие в `bot_stats`
+   (`llm_primary_ok` / `llm_fallback_used` / `llm_fallback_error_<kind>`),
+   ежедневная сводка админам дополняется строкой «LLM: primary N / fallback M»
+   — тихий failover не скрывает деградацию первичного канала. Немедленный
+   admin-алерт — при config-ошибке ЛЮБОГО канала, даже замаскированной
+   успешным fallback; дедуп в памяти процесса, не чаще раза в сутки на канал
+   (повтор после рестарта при всё ещё битой конфигурации допустим).
+   Infra- и content-ошибки остаются в логах и сводке.
+
+### Последствия
+
+- `OPENROUTER_API_KEY` обязателен при активном LLM-контуре; `LLM_API_KEY`
+  теперь обслуживает резервный канал (и будущий YandexART, ADR-003).
+- `LLM_BASE_URL`/`LLM_MODEL` — переопределения **первичного** канала:
+  указать там Yandex — молча сделать резервный канал первичным; резерв
+  переопределяется `LLM_FALLBACK_BASE_URL`/`LLM_FALLBACK_MODEL`. При деплое
+  старые env-перекрытия Yandex из `.env` VPS нужно убрать/перенести.
+- Кулдаун первичного канала в памяти процесса — возможное будущее улучшение,
+  в решение не входит.
+
+---
+
+## ADR-003: Изображения — fal.ai активный провайдер, YandexART отложен заглушкой
+
+Статус: принято (план docs/plans/2026-10-14-dual-channel-llm-images.md;
+решение оператора от 2026-10-17 — YandexART переведён в заглушку).
+
+### Контекст и причины
+
+Контур рубрик не генерирует изображения: банк открыток раздаёт готовые файлы,
+а исследованный YandexART (docs/plans/2026-10-09-epoch0-research.md §2) не
+подключён. Второй активный провайдер изображений на старте не нужен и удваивает
+стоимость интеграции, поэтому решено: подключить fal.ai (порт `FalClient` из
+visual-studio на aiohttp), а YandexART зарезервировать заглушкой — интерфейс,
+конфиг-секция и события наблюдаемости резервируются уже сейчас, чтобы
+полноценный клиент не потребовал переделок.
+
+### Решения
+
+1. **Протокол** (`images/base.py`): `ImageGenerator.generate(prompt) -> bytes`;
+   `ImageGenerationError(kind)` с общей таксономией — config (401/402/403 —
+   ключ/баланс), infra (сеть, 429, 5xx, таймаут, битый ответ). `MAX_IMAGE_BYTES`
+   (10 МБ) на декодированные байты любого провайдера: скачивание потоковое,
+   по превышению лимита — обрыв и infra-ошибка вместо исчерпания памяти.
+2. **FalImageGenerator** (`images/fal.py`) — queue-API fal:
+   `POST https://queue.fal.run/{model}` (`Authorization: Key <FAL_KEY>`) →
+   поллинг `status_url` (интервал ~1.5 с, общий таймаут из конфига — по
+   умолчанию 120 с) до COMPLETED → `GET response_url` → `images[0].url` →
+   потоковое скачивание. Ретраи только транзиентных сбоев (сеть, 429, 5xx)
+   с экспоненциальным backoff; модель по умолчанию — `fal-ai/flux/dev`.
+3. **YandexArtStub** (`images/yandex_art.py`) — заглушка с тем же интерфейсом:
+   `generate()` бросает config-ошибку «not implemented (stub)», в рантайм не
+   подключается и ключа не требует. Докстринг фиксирует контракт будущего
+   клиента (синхронный `POST {base}/images/generations`,
+   `art://<folder_id>/aliceai-image-art-3.0`, ответ `data[0].b64_json`,
+   folder_id из модели резервного LLM-канала, лимит промпта 500 символов),
+   чтобы подключение не требовало переделок протокола и wiring.
+4. **Деградация вместо падения.** Активный провайдер один — fal. Обёртка
+   `FallbackImageGenerator` (`images/fallback.py`) уже принимает второй
+   генератор, но сегодня fallback = None; при сбое fal любого вида пост
+   деградирует до текстового — картинка не роняет слот: warning,
+   `bot_stats`-событие `image_none` и строка в alert исхода слота;
+   config-вид дополнительно зажигает немедленный admin-алерт (как в ADR-002).
+   Требование «оба провайдера изображений» вернётся вместе с реальным
+   клиентом YandexART — wiring при этом не меняется (передаётся второй
+   генератор).
+5. **Конфиг** (`rubrics.yaml` секция `image_generation`, валидатор
+   `config/rubrics.py`): `{fal: {model}, yandex_art: {size}, timeout_seconds}`;
+   ключ добавлен в whitelist топ-ключей валидатора (опечатка роняет запуск).
+   Секция `yandex_art` парсится и валидируется, но провайдер не активируется.
+   Fail-fast: включённая рубрика с `image: generate` без `FAL_KEY` роняет
+   запуск (`RubricsConfigError`) — тихая тотальная деградация всех таких
+   постов недопустима. Значение `image: generate` у рубрики — зарезервированное
+   слово (генерация картинки), `image: <тип банка>` — открытка из банка как
+   раньше, без `image` — пост без картинки; имена типов банка живут в БД,
+   коллизий нет.
+6. **Пайплайн и жизненный цикл файлов** (`rubrics/generative.py`, хелпер
+   `GeneratedImages` — общий с bank-веткой `bank/pipeline.py`): промпт
+   детерминированный, без LLM-раунда — глобальный `image_style` + первые
+   ~200 символов текста поста, суммарно ≤ 500 символов; байты пишутся в
+   `data/generated/<slot_run_id>.png`, исход несёт `image_ref =
+   "generated:<файл>"` — файл персистентен, ретрай публикации не
+   перегенерирует картинку. Publisher (`publishers/slot.py`) читает
+   `generated:`-ссылки из каталога с path-traversal-защитой и удаляет файл
+   после подтверждённой публикации; страховочный TTL-prune (7 дней) —
+   в ежедневном обслуживании рядом с бэкапом БД (`bot/db_backup.py`).
+
+### Последствия
+
+- `FAL_KEY` обязателен только при рубриках с `image: generate`; изображения
+  на старте не пробуются (тарификация за запрос) — config-сбой канала виден
+  по немедленному алерту первой реальной генерации.
+- Ежедневная сводка показывает «картинки: fal A / без картинки C»; событие
+  `image_art_used` и fal/art-разбивка вернутся вместе с клиентом YandexART.
+- Factory-контур остаётся текстовым: `Post` без поля картинки,
+  `MaxPostPublisher` без вложений — вне рамок решения.
 
 ---
 
@@ -253,7 +414,7 @@ Publisher
     │
     ├── writers/
     │   ├── base.py           # Writer-протокол + WriteResult
-    │   ├── llm.py            # LlmWriter (OpenAI-совместимый API Yandex AI Studio)
+    │   ├── llm.py            # LlmWriter (OpenAI-совместимый API: OpenRouter / Yandex)
     │   ├── validator.py      # валидация вывода LLM (лимит 4000)
     │   └── __init__.py
     │
@@ -463,9 +624,9 @@ class Alerter(Protocol):
 
 - `WriteResult` явно различает успех, SKIP (материал нерелевантен или скуден) и
   ошибку с её классом, и несёт usage (токены, латентность) для счётчиков.
-- `LlmWriter` ходит в OpenAI-совместимый API Yandex AI Studio (`base_url` +
-  `model`, `https://ai.api.cloud.yandex.net/v1`, `gpt://<folder_id>/yandexgpt-5-lite`)
-  на уже имеющемся aiohttp — новых pip-зависимостей нет.
+- `LlmWriter` ходит в OpenAI-совместимый API любого провайдера (`base_url` +
+  `model`) на уже имеющемся aiohttp — новых pip-зависимостей нет; дефолт —
+  OpenRouter (`qwen/qwen3.8-flash`), Yandex AI Studio — резервный канал (ADR-002).
 - Один общий `aiohttp.ClientSession` на процесс передаётся в `RssFetcher`,
   `LlmWriter` и `MaxClient` и закрывается при shutdown.
 
@@ -603,8 +764,9 @@ enabled = (env FACTORY_ENABLED, если задан, иначе yaml factory.ena
   модерации.
 - `/posts` — последние посты со статусами, попытками и обрезанными ошибками.
 - Все команды фабрики админские (`ADMIN_IDS`).
-- `enabled=true` без `LLM_API_KEY` — ошибка старта (ValueError): секреты живут
-  только в `.env`.
+- `enabled=true` без `OPENROUTER_API_KEY` / `LLM_API_KEY` — ошибка старта
+  (ValueError): при активном LLM-контуре обязательны оба ключа (ADR-002);
+  секреты живут только в `.env`.
 
 ### Тихие часы и heartbeat
 
@@ -698,6 +860,11 @@ factory:
   active_hours: "08:00-23:00"
   timezone: "Europe/Moscow"
   llm:
+    # первичный LLM-канал (ADR-002)
+    base_url: "https://openrouter.ai/api/v1"
+    model: "qwen/qwen3.8-flash"
+  llm_fallback:
+    # резервный LLM-канал; timeout/max_tokens/temperature общие с primary
     base_url: "https://ai.api.cloud.yandex.net/v1"
     model: "gpt://<folder_id>/yandexgpt-5-lite"
 ```
@@ -713,14 +880,21 @@ LOG_LEVEL=INFO
 POST_INTERVAL_HOURS=6
 REQUEST_TIMEOUT=30
 DATABASE_PATH=
+OPENROUTER_API_KEY=
 LLM_API_KEY=
-LLM_BASE_URL=https://ai.api.cloud.yandex.net/v1
-LLM_MODEL=gpt://<folder_id>/yandexgpt-5-lite
+LLM_BASE_URL=
+LLM_MODEL=
+LLM_FALLBACK_BASE_URL=
+LLM_FALLBACK_MODEL=
+FAL_KEY=
 FACTORY_ENABLED=
 FACTORY_DRY_RUN=
 FACTORY_INTERVAL_HOURS=
 FACTORY_ACTIVE_HOURS=
 ```
+
+`LLM_BASE_URL`/`LLM_MODEL` переопределяют первичный канал (OpenRouter),
+`LLM_FALLBACK_BASE_URL`/`LLM_FALLBACK_MODEL` — резервный (Yandex).
 
 Переменные окружения имеют приоритет над YAML, чтобы настройки можно было менять в Docker без пересборки образа. Прокси-переменных нет: обе платформы (MAX, Yandex) доступны из РФ напрямую (ADR-001).
 

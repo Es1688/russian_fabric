@@ -9,17 +9,25 @@ background tasks to start:
 - repositories over the shared database file;
 - one pipeline per enabled rubric (dispatched by the router below):
   generative / bank / digest / weather;
+- the image generator behind ``image: generate`` rubrics (dual-channel
+  plan §3.2): fal.ai active iff ``FAL_KEY`` is set, bytes to
+  ``data/generated`` (dual-channel plan §3.3);
 - the slot scheduler with the slot publisher, alerter and the contour's
   dry-run flag (``RUBRICS_DRY_RUN``, previews to admins);
 - the admin levers (``/factory`` rubric arguments), the daily summary
   service and the daily backup service.
 
-Construction performs no network calls; config validation has already
-failed fast on a broken yaml, a contour conflict or a missing LLM key.
+Construction makes exactly one network call: the readiness probe of the
+wired LLM channels (dual-channel plan §2.1) — a config-kind failure
+(broken key/balance/model) fails the launch, an infra-kind one (timeout,
+network, 5xx) only logs a warning and the startup continues. Everything
+else stays offline; config validation has already failed fast on a broken
+yaml, a contour conflict or a missing LLM key.
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -37,6 +45,8 @@ from max_news_bot.bot.slot_scheduler import (
 )
 from max_news_bot.config.news_sources import NewsSource, load_news_sources
 from max_news_bot.config.rubrics import LLM_KINDS, RubricConfig, RubricsConfig
+from max_news_bot.images import FalImageGenerator, FallbackImageGenerator
+from max_news_bot.images.base import ImageGenerator
 from max_news_bot.publishers.alerter import MaxAlerter
 from max_news_bot.publishers.slot import MaxSlotPublisher
 from max_news_bot.rubrics.digest import DigestPipeline
@@ -56,6 +66,8 @@ from max_news_bot.weather import (
     WeatherPipeline,
 )
 from max_news_bot.writers.completion import LlmCompletion, LlmCompletionClient
+from max_news_bot.writers.fallback import FallbackCompletion
+from max_news_bot.writers.readiness import probe_llm_channels
 
 if TYPE_CHECKING:
     from max_news_bot.config.loader import AppConfig
@@ -70,6 +82,11 @@ logger = get_logger(__name__)
 # relative to this directory); a missing card degrades to a text-only post,
 # so the directory itself is created lazily by the operator's import.
 POSTCARDS_DIR_NAME = "postcards"
+
+# Generated slot images (``image: generate``, dual-channel plan §3.3) land
+# next to the database; the daily backup service TTL-prunes the same
+# directory (its default matches this name).
+GENERATED_DIR_NAME = "generated"
 
 
 class RubricPipelineRouter:
@@ -130,31 +147,89 @@ class RubricsRuntime:
     alerter: MaxAlerter
 
 
-def _build_completion(
-    config: AppConfig, http_session: aiohttp.ClientSession | None
+async def _build_completion(
+    config: AppConfig,
+    http_session: aiohttp.ClientSession | None,
+    db: Database,
+    alerter: MaxAlerter,
 ) -> LlmCompletion | None:
+    """Primary completion client wrapped into the per-request failover
+    when the fallback channel is configured (dual-channel plan §2.3);
+    both wired channels are readiness-probed here (§2.1) — the single
+    network call of the contour's construction, before the first slot."""
     llm = config.factory.llm
     if not llm.api_key:
         return None
-    return LlmCompletionClient(
+    primary = LlmCompletionClient(
         base_url=llm.base_url,
         api_key=llm.api_key,
         model=llm.model,
         timeout=llm.timeout,
         max_tokens=llm.max_tokens,
         temperature=llm.temperature,
+        disable_reasoning=llm.disable_reasoning,
         session=http_session,
+    )
+    fallback_llm = config.factory.llm_fallback
+    fallback = (
+        None
+        if fallback_llm is None
+        else LlmCompletionClient(
+            base_url=fallback_llm.base_url,
+            api_key=fallback_llm.api_key,
+            model=fallback_llm.model,
+            # timeout / max_tokens / temperature are shared with the
+            # primary channel (dual-channel plan §2.1)
+            timeout=llm.timeout,
+            max_tokens=llm.max_tokens,
+            temperature=llm.temperature,
+            disable_reasoning=fallback_llm.disable_reasoning,
+            session=http_session,
+        )
+    )
+    await probe_llm_channels(config.factory, http_session)
+    if fallback is None:
+        # a single channel is valid only outside LLM contours
+        return primary
+    return FallbackCompletion(primary, fallback, db=db, alerter=alerter)
+
+
+def _build_image_generator(
+    rubrics: RubricsConfig, http_session: aiohttp.ClientSession | None
+) -> ImageGenerator | None:
+    """fal.ai primary wrapped into the failover shell (dual-channel plan
+    §3.2): the provider is active iff its key is configured. Construction
+    stays offline, so this keeps the "one network call" invariant; the
+    fail-fast for ``image: generate`` rubrics without a key already ran in
+    config validation."""
+    api_key = os.getenv("FAL_KEY", "").strip()
+    if not api_key:
+        return None
+    return FallbackImageGenerator(
+        FalImageGenerator(
+            api_key=api_key,
+            model=rubrics.image_generation.fal.model,
+            timeout=rubrics.image_generation.timeout_seconds,
+            session=http_session,
+        )
     )
 
 
-def build_rubrics_runtime(
+async def build_rubrics_runtime(
     config: AppConfig,
     db: Database,
     client: MaxClient,
     http_session: aiohttp.ClientSession | None,
     fetcher: Fetcher,
 ) -> RubricsRuntime:
-    """Wire the whole rubrics contour; no network calls happen here."""
+    """Wire the whole rubrics contour.
+
+    The old "no network calls during construction" invariant is
+    deliberately revised (dual-channel plan §2.4): the readiness probe of
+    the wired LLM channels is now the construction's only network call —
+    a config-kind probe failure (broken key/balance/model) fails the
+    launch, an infra-kind one logs a warning and the startup continues.
+    """
     rubrics: RubricsConfig = config.rubrics
     runs = SlotRunRepository(db.path)
     states = RubricStateRepository(db.path)
@@ -162,7 +237,9 @@ def build_rubrics_runtime(
     filter_log = FilterLogRepository(db.path)
     digest_items = DigestItemsRepository(db.path)
     alerter = MaxAlerter(client, config.admin_ids)
-    completion = _build_completion(config, http_session)
+    completion = await _build_completion(config, http_session, db, alerter)
+    generated_dir = db.path.parent / GENERATED_DIR_NAME
+    images = _build_image_generator(rubrics, http_session)
 
     enabled = [rubric for rubric in rubrics.rubrics if rubric.enabled]
     needs_llm = any(rubric.kind in LLM_KINDS for rubric in enabled)
@@ -179,10 +256,32 @@ def build_rubrics_runtime(
         if rubric.kind == "generative":
             router.bind(
                 rubric,
-                GenerativePipeline(rubrics, completion, bank, runs, filter_log),
+                GenerativePipeline(
+                    rubrics,
+                    completion,
+                    bank,
+                    runs,
+                    filter_log,
+                    images=images,
+                    generated_dir=generated_dir,
+                    db=db,
+                    alerter=alerter,
+                ),
             )
         elif rubric.kind == "bank":
-            router.bind(rubric, BankPipeline(rubrics, bank, runs, completion))
+            router.bind(
+                rubric,
+                BankPipeline(
+                    rubrics,
+                    bank,
+                    runs,
+                    completion,
+                    images=images,
+                    generated_dir=generated_dir,
+                    db=db,
+                    alerter=alerter,
+                ),
+            )
         elif rubric.kind == "weather":
             if weather_provider is None:
                 points = rubrics.weather_points
@@ -203,6 +302,7 @@ def build_rubrics_runtime(
         config.admin_ids,
         bank=bank,
         postcards_dir=db.path.parent / POSTCARDS_DIR_NAME,
+        generated_dir=generated_dir,
     )
     scheduler = SlotScheduler(
         rubrics,
@@ -216,7 +316,16 @@ def build_rubrics_runtime(
 
     # Digest pipelines close over the scheduler's empty-source breaker
     # (plan section 11), so they are bound after the scheduler exists.
-    bank_fallback = BankPipeline(rubrics, bank, runs, completion)
+    bank_fallback = BankPipeline(
+        rubrics,
+        bank,
+        runs,
+        completion,
+        images=images,
+        generated_dir=generated_dir,
+        db=db,
+        alerter=alerter,
+    )
     for rubric in digest_rubrics:
         router.bind(
             rubric,

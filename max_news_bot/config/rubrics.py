@@ -1,9 +1,10 @@
 """Rubrics configuration for the autonomous channel (plan section 8).
 
 ``rubrics.yaml`` lives next to ``sources.yaml`` and carries the global
-section (timezone, persona, image_style, targets, daily_cap, weather points)
-plus one block per rubric. Everything is validated here at startup: a typo
-must abort the launch, not surface as a broken 07:00 post.
+section (timezone, persona, image_style, image_generation, targets,
+daily_cap, weather points) plus one block per rubric. Everything is
+validated here at startup: a typo must abort the launch, not surface as a
+broken 07:00 post.
 
 The rubrics contour itself is switched by the RUBRICS_ENABLED env flag
 (default false). Mutual exclusivity with the legacy loops (digest scheduler
@@ -33,11 +34,20 @@ RUBRIC_KINDS = ("generative", "bank", "weather", "digest")
 ON_LLM_FAILURE_POLICIES = ("bank", "skip")
 # Kinds that call the LLM and therefore require LLM_API_KEY at startup.
 LLM_KINDS = ("generative", "digest")
+# Reserved per-rubric `image` value meaning generated images (dual-channel
+# plan section 3): bank type names live in the DB, and the reservation keeps
+# a bank type from shadowing the switch.
+GENERATE_IMAGE = "generate"
 # MAX message hard limit (plan section 4: weather must fit 4000 chars).
 MAX_POST_CHARS = 4000
 # Daily admin summary slot (plan section 11): a fixed config time after the
 # last post of the grid (21:30), quoted in yaml like rubric times.
 DEFAULT_SUMMARY_TIME = "22:40"
+# Image generation defaults (dual-channel plan section 3.2): fal is the
+# only active provider, yandex_art is reserved as a stub.
+DEFAULT_FAL_MODEL = "fal-ai/flux/dev"
+DEFAULT_YANDEX_ART_SIZE = "1024x1024"
+DEFAULT_IMAGE_TIMEOUT_SECONDS = 120
 
 _RUBRIC_ID_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 # NOTE: rubric times must be quoted in yaml: unquoted "12:30" parses as a
@@ -48,6 +58,7 @@ _TOP_LEVEL_KEYS = (
     "timezone",
     "persona",
     "image_style",
+    "image_generation",
     "targets",
     "daily_cap",
     "weather",
@@ -57,6 +68,9 @@ _TOP_LEVEL_KEYS = (
 _TARGET_KEYS = ("channel_id", "channel_id_env")
 _WEATHER_KEYS = ("points",)
 _WEATHER_POINT_KEYS = ("name", "latitude", "longitude")
+_IMAGE_GENERATION_KEYS = ("fal", "yandex_art", "timeout_seconds")
+_FAL_IMAGE_KEYS = ("model",)
+_YANDEX_ART_IMAGE_KEYS = ("size",)
 _RUBRIC_KEYS = (
     "id",
     "enabled",
@@ -97,6 +111,37 @@ class TargetConfig:
 
 
 @dataclass(frozen=True)
+class FalImageConfig:
+    """fal.ai generation settings; the provider is active iff FAL_KEY is set."""
+
+    model: str = DEFAULT_FAL_MODEL
+
+
+@dataclass(frozen=True)
+class YandexArtImageConfig:
+    """Reserved second image provider (stub): parsed and validated but never
+    activated until the real client lands, so it requires no key yet."""
+
+    size: str = DEFAULT_YANDEX_ART_SIZE
+
+
+@dataclass(frozen=True)
+class ImageGenerationConfig:
+    """Provider settings with a fixed priority: fal first, then yandex_art."""
+
+    fal: FalImageConfig
+    yandex_art: YandexArtImageConfig
+    timeout_seconds: int = DEFAULT_IMAGE_TIMEOUT_SECONDS
+
+
+# Default for configs that omit image_generation (the section is not needed
+# without image: generate rubrics); frozen, so sharing the instance is safe.
+DEFAULT_IMAGE_GENERATION = ImageGenerationConfig(
+    fal=FalImageConfig(), yandex_art=YandexArtImageConfig()
+)
+
+
+@dataclass(frozen=True)
 class RubricConfig:
     id: str
     enabled: bool
@@ -132,6 +177,9 @@ class RubricsConfig:
     weather_points: tuple[WeatherPoint, ...]
     rubrics: tuple[RubricConfig, ...]
     summary_time: str = DEFAULT_SUMMARY_TIME  # "HH:MM" local, plan section 11
+    # Image generation providers (dual-channel plan section 3); the default
+    # applies when rubrics.yaml omits the section.
+    image_generation: ImageGenerationConfig = DEFAULT_IMAGE_GENERATION
     # Contour dry-run (plan section 14, stage 1): slots run the full cycle
     # but posts go to the admins as previews instead of the channel. True
     # by default - the cutover to publishing is a separate deliberate env
@@ -298,6 +346,58 @@ def _parse_weather_points(raw: Any) -> tuple[WeatherPoint, ...]:
             WeatherPoint(name=name, latitude=latitude, longitude=longitude)
         )
     return tuple(points)
+
+
+def _parse_image_generation(raw: Any) -> ImageGenerationConfig:
+    section = raw if raw is not None else {}
+    if not isinstance(section, Mapping):
+        raise RubricsConfigError("image_generation: expected a mapping")
+    _reject_unknown_keys(section, _IMAGE_GENERATION_KEYS, "image_generation")
+
+    fal_raw = section.get("fal")
+    fal_section = fal_raw if fal_raw is not None else {}
+    if not isinstance(fal_section, Mapping):
+        raise RubricsConfigError("image_generation.fal: expected a mapping")
+    _reject_unknown_keys(fal_section, _FAL_IMAGE_KEYS, "image_generation.fal")
+    fal = FalImageConfig(
+        model=_as_str(
+            fal_section.get("model", DEFAULT_FAL_MODEL),
+            "image_generation.fal.model",
+        )
+    )
+
+    # Reserved stub (dual-channel plan section 3): parsed and validated, but
+    # the provider is never activated and no key is required until the real
+    # client lands.
+    art_raw = section.get("yandex_art")
+    art_section = art_raw if art_raw is not None else {}
+    if not isinstance(art_section, Mapping):
+        raise RubricsConfigError(
+            "image_generation.yandex_art: expected a mapping"
+        )
+    _reject_unknown_keys(
+        art_section, _YANDEX_ART_IMAGE_KEYS, "image_generation.yandex_art"
+    )
+    yandex_art = YandexArtImageConfig(
+        size=_as_str(
+            art_section.get("size", DEFAULT_YANDEX_ART_SIZE),
+            "image_generation.yandex_art.size",
+        )
+    )
+
+    timeout_seconds = _as_int(
+        section.get("timeout_seconds", DEFAULT_IMAGE_TIMEOUT_SECONDS),
+        "image_generation.timeout_seconds",
+    )
+    if timeout_seconds < 1:
+        raise RubricsConfigError(
+            "image_generation.timeout_seconds: expected a positive integer, "
+            f"got {timeout_seconds}"
+        )
+
+    return ImageGenerationConfig(
+        fal=fal, yandex_art=yandex_art, timeout_seconds=timeout_seconds
+    )
 
 
 def _parse_days(raw: Any, where: str) -> tuple[str, ...]:
@@ -513,6 +613,7 @@ def _parse_rubrics_config(
         if image_style_raw is not None
         else ""
     )
+    image_generation = _parse_image_generation(raw.get("image_generation"))
 
     daily_cap = _as_int(raw.get("daily_cap", 6), "daily_cap")
     if daily_cap < 1:
@@ -551,6 +652,19 @@ def _parse_rubrics_config(
             "weather: points are required when a weather rubric is enabled"
         )
 
+    # Fail-fast (dual-channel plan section 3.2): an enabled rubric with
+    # image: generate needs a working image provider; fal is the only active
+    # one (yandex_art is a stub), so a missing FAL_KEY must abort the launch
+    # instead of degrading every such post to text-only. Checked while the
+    # contour is off too - the yaml is validated on every restart.
+    if any(
+        rubric.enabled and rubric.image == GENERATE_IMAGE for rubric in rubrics
+    ) and not os.getenv("FAL_KEY", "").strip():
+        raise RubricsConfigError(
+            "image: generate requires the FAL_KEY environment variable: fal "
+            "is the only active image provider (yandex_art is a stub)"
+        )
+
     return RubricsConfig(
         enabled=enabled,
         timezone=timezone,
@@ -561,6 +675,7 @@ def _parse_rubrics_config(
         weather_points=weather_points,
         rubrics=rubrics,
         summary_time=summary_time,
+        image_generation=image_generation,
         # Deploy-level roll-out switch, same shape as FACTORY_DRY_RUN:
         # previews to admins by default, publishing only when turned off.
         dry_run=_env_flag("RUBRICS_DRY_RUN", True),

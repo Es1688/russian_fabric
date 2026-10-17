@@ -30,6 +30,8 @@ from max_news_bot.bank.pipeline import (
 )
 from max_news_bot.config.rubrics import RubricConfig, RubricsConfig, TargetConfig
 from max_news_bot.core.models import ContentBankItem, SlotRun
+from max_news_bot.images.base import ImageGenerationError
+from max_news_bot.images.fallback import FallbackImageGenerator
 from max_news_bot.utils.db import Database
 from max_news_bot.utils.repositories import (
     ContentBankRepository,
@@ -73,6 +75,11 @@ def runs_repo(repo_path: Path) -> SlotRunRepository:
     return SlotRunRepository(repo_path)
 
 
+@pytest.fixture
+def db_repo(repo_path: Path) -> Database:
+    return Database(repo_path)
+
+
 def make_rubric(
     rubric_id: str = "good_morning",
     *,
@@ -107,12 +114,12 @@ def make_rubric(
     )
 
 
-def make_config() -> RubricsConfig:
+def make_config(image_style: str = "") -> RubricsConfig:
     return RubricsConfig(
         enabled=True,
         timezone="Europe/Moscow",
         persona=PERSONA,
-        image_style="",
+        image_style=image_style,
         targets={"main": TargetConfig(name="main", channel_id=-1001234567890)},
         daily_cap=6,
         weather_points=(),
@@ -161,6 +168,16 @@ async def publish_run(
     await runs.save(replace(run, status="published", text=text))
 
 
+async def claim_run(
+    runs: SlotRunRepository, rubric_id: str, slot_date: str = SLOT_DATE
+) -> SlotRun:
+    """A claimed run carries the repository id the generated file is
+    named after (generated images need a real slot_run_id)."""
+    run = await runs.try_claim(rubric_id, slot_date)
+    assert run is not None
+    return run
+
+
 class FakeCompletion:
     """LlmCompletion double: scripted outputs / error, every call recorded."""
 
@@ -183,12 +200,43 @@ class FakeCompletion:
         return CompletionResult(content=content, tokens=10, model="test-model")
 
 
+PNG_BYTES = b"\x89PNG\r\n\x1a\n fake generated image bytes"
+
+
+class MockImageGenerator:
+    """ImageGenerator double: scripted bytes / errors, prompts recorded."""
+
+    def __init__(self, script: list) -> None:
+        self._script = list(script)
+        self.prompts: list[str] = []
+
+    async def generate(self, prompt: str) -> bytes:
+        self.prompts.append(prompt)
+        item = self._script.pop(0) if len(self._script) > 1 else self._script[0]
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
 def make_pipeline(
     bank: ContentBankRepository,
     runs: SlotRunRepository,
     completion: FakeCompletion | None = None,
+    *,
+    image_style: str = "",
+    images: FallbackImageGenerator | None = None,
+    generated_dir: Path | None = None,
+    db: Database | None = None,
 ) -> BankPipeline:
-    return BankPipeline(make_config(), bank, runs, completion)
+    return BankPipeline(
+        make_config(image_style),
+        bank,
+        runs,
+        completion,
+        images=images,
+        generated_dir=generated_dir,
+        db=db,
+    )
 
 
 # --- source parsing -----------------------------------------------------------
@@ -677,6 +725,73 @@ async def test_empty_postcard_stock_degrades_to_text_only(
     assert outcome.status == "generated"
     assert outcome.image_ref is None
     assert outcome.text is not None
+
+
+# --- generated images: image: generate (dual-channel plan §3.3) -----------------
+
+
+async def test_image_generate_writes_file_and_generated_ref(
+    bank_repo: ContentBankRepository,
+    runs_repo: SlotRunRepository,
+    db_repo: Database,
+    tmp_path: Path,
+) -> None:
+    rubric = make_rubric(source={"bank_types": ["phrase"]}, image="generate")
+    await seed(bank_repo, bank_item("phrase", "Тише едешь — дальше будешь."))
+    generated_dir = tmp_path / "generated"
+    generator = MockImageGenerator([PNG_BYTES])
+    pipeline = make_pipeline(
+        bank_repo,
+        runs_repo,
+        images=FallbackImageGenerator(generator, None),
+        generated_dir=generated_dir,
+        db=db_repo,
+    )
+    run = await claim_run(runs_repo, rubric.id)
+
+    outcome = await pipeline.generate(rubric, run, now=NOW)
+
+    assert outcome.status == "generated"
+    assert outcome.image_ref == f"generated:{run.id}.png"
+    # the thin bank's stock alert may fire, but never an image failure
+    assert outcome.alert is None or "generation failed" not in outcome.alert
+    assert (generated_dir / f"{run.id}.png").read_bytes() == PNG_BYTES
+    event = await db_repo.get_last_event("image_fal_ok")
+    assert event is not None
+    assert f"run={run.id}" in event["details"]
+    assert await db_repo.get_last_event("image_none") is None
+
+
+async def test_image_generation_failure_degrades_to_text_only(
+    bank_repo: ContentBankRepository,
+    runs_repo: SlotRunRepository,
+    db_repo: Database,
+    tmp_path: Path,
+) -> None:
+    # fal fails with no fallback wired: text-only post + alert + event
+    rubric = make_rubric(source={"bank_types": ["phrase"]}, image="generate")
+    await seed(bank_repo, bank_item("phrase", "Тише едешь — дальше будешь."))
+    generated_dir = tmp_path / "generated"
+    generator = MockImageGenerator([ImageGenerationError("infra", "fal http 500")])
+    pipeline = make_pipeline(
+        bank_repo,
+        runs_repo,
+        images=FallbackImageGenerator(generator, None),
+        generated_dir=generated_dir,
+        db=db_repo,
+    )
+    run = await claim_run(runs_repo, rubric.id)
+
+    outcome = await pipeline.generate(rubric, run, now=NOW)
+
+    # a broken picture must not fail the 07:00 slot
+    assert outcome.status == "generated"
+    assert outcome.text is not None
+    assert outcome.image_ref is None
+    assert outcome.alert is not None and "generation failed" in outcome.alert
+    assert not generated_dir.exists()
+    event = await db_repo.get_last_event("image_none")
+    assert event is not None and "kind=infra" in event["details"]
 
 
 # --- stock alerts (plan section 6) ----------------------------------------------

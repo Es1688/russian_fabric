@@ -41,6 +41,8 @@ class LlmConfig:
     max_tokens: int
     temperature: float
     api_key: str  # env-only secret, never in yaml
+    # thinking models otherwise burn the whole max_tokens on reasoning
+    disable_reasoning: bool = False
 
 
 @dataclass(frozen=True)
@@ -63,6 +65,10 @@ class FactoryConfig:
     exclude_keywords: list[str]
     llm: LlmConfig
     prompt: str
+    # None unless LLM_API_KEY is set; mandatory with the primary channel
+    # whenever an LLM contour is active (enforced by load_config).
+    # Last field on purpose: every field above lacks a default.
+    llm_fallback: LlmConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -128,10 +134,62 @@ def _parse_factory(raw: dict[str, Any]) -> FactoryConfig:
     """Factory section of sources.yaml with env overrides.
 
     Enabled order: FACTORY_ENABLED env if set, else yaml ``factory.enabled``.
-    LLM_API_KEY is env-only; an enabled factory without it fails fast.
+    LLM secrets are env-only: OPENROUTER_API_KEY for the primary channel,
+    LLM_API_KEY (Yandex) for the fallback; llm_fallback is None unless
+    LLM_API_KEY is set. An active LLM contour lacking either key fails
+    fast in load_config.
     """
     llm_raw = raw.get("llm", {}) or {}
-    api_key = os.getenv("LLM_API_KEY", "").strip()
+    fallback_raw = raw.get("llm_fallback", {}) or {}
+    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    fallback_api_key = os.getenv("LLM_API_KEY", "").strip()
+
+    # timeout / max_tokens / temperature are shared by both channels
+    timeout = int(llm_raw.get("timeout", 60))
+    max_tokens = int(llm_raw.get("max_tokens", 800))
+    temperature = float(llm_raw.get("temperature", 0.7))
+
+    llm = LlmConfig(
+        base_url=_env_str(
+            "LLM_BASE_URL",
+            str(llm_raw.get("base_url", "https://openrouter.ai/api/v1")),
+        ),
+        model=_env_str(
+            "LLM_MODEL", str(llm_raw.get("model", "qwen/qwen3.8-flash"))
+        ),
+        timeout=timeout,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        api_key=api_key,
+        disable_reasoning=bool(llm_raw.get("disable_reasoning", True)),
+    )
+    # The fallback exists iff its Yandex key is configured: a single
+    # channel is valid only outside LLM contours (digest/weather).
+    llm_fallback = None
+    if fallback_api_key:
+        llm_fallback = LlmConfig(
+            # Yandex AI Studio OpenAI-compatible endpoint; models are full
+            # URIs gpt://<folder_id>/<model>. FOLDER_ID in the default is a
+            # placeholder — set the real Yandex Cloud folder id in
+            # sources.yaml or via the LLM_FALLBACK_MODEL env var.
+            base_url=_env_str(
+                "LLM_FALLBACK_BASE_URL",
+                str(
+                    fallback_raw.get(
+                        "base_url", "https://ai.api.cloud.yandex.net/v1"
+                    )
+                ),
+            ),
+            model=_env_str(
+                "LLM_FALLBACK_MODEL",
+                str(fallback_raw.get("model", "gpt://FOLDER_ID/yandexgpt-5-lite")),
+            ),
+            timeout=timeout,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            api_key=fallback_api_key,
+            disable_reasoning=bool(fallback_raw.get("disable_reasoning", False)),
+        )
 
     return FactoryConfig(
         enabled=_env_bool("FACTORY_ENABLED", bool(raw.get("enabled", False))),
@@ -152,30 +210,25 @@ def _parse_factory(raw: dict[str, Any]) -> FactoryConfig:
         max_news_per_source=int(raw.get("max_news_per_source", 5)),
         include_keywords=[str(x) for x in raw.get("include_keywords", [])],
         exclude_keywords=[str(x) for x in raw.get("exclude_keywords", [])],
-        llm=LlmConfig(
-            # Yandex AI Studio OpenAI-compatible endpoint; models are full
-            # URIs gpt://<folder_id>/<model>. FOLDER_ID in the default is a
-            # placeholder — set the real Yandex Cloud folder id in
-            # sources.yaml or via the LLM_MODEL env var.
-            base_url=_env_str(
-                "LLM_BASE_URL",
-                str(
-                    llm_raw.get(
-                        "base_url", "https://ai.api.cloud.yandex.net/v1"
-                    )
-                ),
-            ),
-            model=_env_str(
-                "LLM_MODEL",
-                str(llm_raw.get("model", "gpt://FOLDER_ID/yandexgpt-5-lite")),
-            ),
-            timeout=int(llm_raw.get("timeout", 60)),
-            max_tokens=int(llm_raw.get("max_tokens", 800)),
-            temperature=float(llm_raw.get("temperature", 0.7)),
-            api_key=api_key,
-        ),
+        llm=llm,
         prompt=str(raw.get("prompt") or _DEFAULT_FACTORY_PROMPT),
+        llm_fallback=llm_fallback,
     )
+
+
+def _missing_llm_keys(factory: FactoryConfig) -> list[str]:
+    """Env names of the absent LLM channel keys (primary and/or fallback)."""
+    return [
+        name
+        for name, value in (
+            ("OPENROUTER_API_KEY", factory.llm.api_key),
+            (
+                "LLM_API_KEY",
+                factory.llm_fallback.api_key if factory.llm_fallback else "",
+            ),
+        )
+        if not value
+    ]
 
 
 def _parse_sources(raw: list[dict[str, Any]]) -> list[SourceConfig]:
@@ -236,8 +289,14 @@ def load_config() -> AppConfig:
             f"MAX_CHANNEL_ID must be an integer chat id, got: {channel_id_raw!r}"
         ) from exc
 
-    if factory.enabled and not factory.llm.api_key:
-        raise ValueError("LLM_API_KEY is required when factory is enabled")
+    if factory.enabled:
+        missing = _missing_llm_keys(factory)
+        if missing:
+            raise ValueError(
+                f"{' and '.join(missing)} required when factory is enabled: "
+                "both LLM keys must be set (primary OpenRouter, fallback "
+                "Yandex) - a single channel defeats the declared failover"
+            )
 
     admin_ids = [
         int(value)
@@ -267,14 +326,14 @@ def load_config() -> AppConfig:
             raise ValueError(
                 "RUBRICS_ENABLED=true but rubrics.yaml defines no enabled rubrics"
             )
-        if (
-            any(item.kind in LLM_KINDS for item in enabled_rubrics)
-            and not factory.llm.api_key
-        ):
-            raise ValueError(
-                "LLM_API_KEY is required when rubrics of LLM kinds "
-                f"({', '.join(LLM_KINDS)}) are enabled"
-            )
+        if any(item.kind in LLM_KINDS for item in enabled_rubrics):
+            missing = _missing_llm_keys(factory)
+            if missing:
+                raise ValueError(
+                    f"{' and '.join(missing)} required when rubrics of LLM "
+                    f"kinds ({', '.join(LLM_KINDS)}) are enabled: both LLM "
+                    "keys must be set (primary OpenRouter, fallback Yandex)"
+                )
         if rubrics.dry_run and not admin_ids:
             raise ValueError(
                 "ADMIN_IDS is required when the rubrics contour is in dry-run "

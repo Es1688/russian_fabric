@@ -23,6 +23,12 @@ own threshold, plus the last ``history_n`` published posts of the
 rubric inside the formatting prompt (plan section 3). A shown record
 gets its counters bumped, and a stock below 30 days raises an alert
 with the reserve type first (plan section 6).
+
+Images (dual-channel plan §3.3): the reserved ``rubric.image`` value
+``generate`` generates the card through the shared ``GeneratedImages``
+helper (``rubrics/generative.py``) instead of drawing one from the bank;
+a generation failure degrades the post to text-only without failing
+the slot.
 """
 
 from __future__ import annotations
@@ -30,6 +36,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
@@ -45,8 +52,16 @@ from max_news_bot.bank.postcards import (
     select_postcard,
 )
 from max_news_bot.bank.validator import validate_bank_formatting
-from max_news_bot.config.rubrics import RubricConfig, RubricsConfig
+from max_news_bot.config.rubrics import (
+    GENERATE_IMAGE,
+    RubricConfig,
+    RubricsConfig,
+)
 from max_news_bot.core.models import ContentBankItem, SlotRun
+from max_news_bot.images.base import ImageGenerator
+from max_news_bot.publishers.alerter import Alerter
+from max_news_bot.rubrics.generative import GeneratedImages
+from max_news_bot.utils.db import Database
 from max_news_bot.utils.logging import get_logger
 from max_news_bot.utils.repositories import (
     ContentBankRepository,
@@ -226,12 +241,24 @@ class BankPipeline:
         bank: ContentBankRepository,
         runs: SlotRunRepository,
         completion: LlmCompletion | None = None,
+        *,
+        images: ImageGenerator | None = None,
+        generated_dir: Path | None = None,
+        db: Database | None = None,
+        alerter: Alerter | None = None,
     ) -> None:
         self._tz = ZoneInfo(config.timezone)
         self._persona = config.persona
         self._bank = bank
         self._runs = runs
         self._completion = completion
+        self._images = GeneratedImages(
+            images,
+            generated_dir,
+            image_style=config.image_style,
+            db=db,
+            alerter=alerter,
+        )
 
     # --- RubricPipeline -------------------------------------------------------
 
@@ -269,7 +296,7 @@ class BankPipeline:
                 ),
                 error_kind="content",
             )
-        return await self._finish(rubric, source, item, month=local.month)
+        return await self._finish(rubric, source, item, run=run, month=local.month)
 
     async def fallback_post(
         self, rubric: RubricConfig, run: SlotRun, *, now: datetime
@@ -296,7 +323,7 @@ class BankPipeline:
                 error_kind="content",
             )
         # a reserve must work on any day: no seasonality for the card either
-        return await self._finish(rubric, source, item, month=None)
+        return await self._finish(rubric, source, item, run=run, month=None)
 
     # --- selection -------------------------------------------------------------
 
@@ -334,6 +361,7 @@ class BankPipeline:
         source: BankSource,
         item: ContentBankItem,
         *,
+        run: SlotRun,
         month: int | None,
     ) -> GenerationOutcome:
         """Format (optionally), validate, bump counters, report stock."""
@@ -388,8 +416,11 @@ class BankPipeline:
         # for anti-repeat than repeating a possibly delivered post.
         assert item.id is not None  # repository-assigned on insert
         await self._bank.mark_shown(item.id)
-        image_ref = await self._postcard_ref(rubric, item, month)
-        alert = await self._stock_alert(source)
+        image_ref, image_alert = await self._postcard_ref(rubric, item, run, text, month)
+        alert = image_alert
+        stock_alert = await self._stock_alert(source)
+        if stock_alert:
+            alert = f"{alert}\n{stock_alert}" if alert else stock_alert
         return GenerationOutcome(
             status="generated",
             text=text,
@@ -399,22 +430,32 @@ class BankPipeline:
         )
 
     async def _postcard_ref(
-        self, rubric: RubricConfig, item: ContentBankItem, month: int | None
-    ) -> str | None:
-        """Concrete postcard image_ref for the slot (plan section 12).
+        self,
+        rubric: RubricConfig,
+        item: ContentBankItem,
+        run: SlotRun,
+        text: str,
+        month: int | None,
+    ) -> tuple[str | None, str | None]:
+        """Concrete image_ref and alert of the slot (plan sections 3.3, 12).
 
-        With ``rubric.image`` unset the rubric ships without a card. When
-        the selected record is itself a postcard (its metadata carries an
+        With ``rubric.image`` unset the rubric ships without a card. The
+        reserved value ``generate`` generates the picture (dual-channel
+        plan §3.3): the ref is ``generated:<file>`` and a failure only
+        degrades the post to text-only via the returned alert. When the
+        selected record is itself a postcard (its metadata carries an
         image file), it is its own card - text and image come from one
         bank record and its show counter is already bumped. Otherwise a
         card is drawn from the bank type named by ``rubric.image``, least
         shown first, so the card stock rotates; an empty card stock
         degrades to a text-only post - a missing card must not fail the
         07:00 slot."""
+        if rubric.image == GENERATE_IMAGE:
+            return await self._images.slot_ref(rubric, run, text)
         if rubric.image is None:
-            return None
+            return None, None
         if has_image(item):
-            return postcard_ref(item)
+            return postcard_ref(item), None
         card = await select_postcard(self._bank, rubric.image, month=month)
         if card is None:
             logger.warning(
@@ -422,10 +463,10 @@ class BankPipeline:
                 rubric.id,
                 rubric.image,
             )
-            return None
+            return None, None
         assert card.id is not None  # repository-assigned on insert
         await self._bank.mark_shown(card.id)
-        return postcard_ref(card)
+        return postcard_ref(card), None
 
     # --- stock alerts ----------------------------------------------------------
 

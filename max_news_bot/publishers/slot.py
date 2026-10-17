@@ -13,6 +13,11 @@ slot. A *transport* failure (``/uploads`` down, rate limited) fails the
 publish as infra instead: the scheduler keeps the generated text with its
 image_ref and retries the whole publish after the global pause, so the
 post is never silently sent without its card because MAX was flaky.
+
+Generated slot images (``generated:<file>`` refs of ``image: generate``
+rubrics, dual-channel plan §3.3) follow the same policy and are deleted
+after the confirmed publish: until then the file stays on disk for
+publish retries, after it the daily backup TTL prunes crash leftovers.
 """
 
 from __future__ import annotations
@@ -49,10 +54,33 @@ _MAX_SEND_ATTEMPTS = 3  # total tries per message on rate limiting
 # recommend a pause with a growing interval (research report section 1.4)
 _MAX_ATTACHMENT_READY_ATTEMPTS = 4
 
+# generated slot image refs ("generated:<file>", rubrics/generative.py);
+# the files are plain names inside one dedicated directory
+_GENERATED_REF_PREFIX = "generated:"
+# same MAX-accepted image set as bank/postcards.py (kept local: the bank
+# module speaks bank records, not generated files)
+_GENERATED_CONTENT_TYPES = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+    ".heic": "image/heic",
+}
+
 
 def image_attachment(token: str) -> dict[str, Any]:
     """The /messages attachment payload for an uploaded image."""
     return {"type": "image", "payload": {"token": token}}
+
+
+def _is_bare_name(name: str) -> bool:
+    """True for a single plain path component (the postcards guard,
+    stricter: generated refs never carry subdirectories)."""
+    path = Path(name)
+    return not path.is_absolute() and ".." not in path.parts and len(path.parts) == 1
 
 
 class MaxSlotPublisher:
@@ -71,11 +99,13 @@ class MaxSlotPublisher:
         *,
         bank: ContentBankRepository,
         postcards_dir: Path,
+        generated_dir: Path | None = None,
     ) -> None:
         self._client = client
         self._admin_ids = list(admin_ids)
         self._bank = bank
         self._postcards_dir = postcards_dir
+        self._generated_dir = generated_dir
         self._uploader = MaxMediaUploader(client)
         self._sends = 0
 
@@ -94,6 +124,9 @@ class MaxSlotPublisher:
                 error_kind="content",
             )
         attachments: list[dict[str, Any]] | None = None
+        is_generated_ref = bool(
+            image_ref and image_ref.strip().startswith(_GENERATED_REF_PREFIX)
+        )
         if image_ref and image_ref.strip():
             try:
                 attachments = await self._postcard_attachments(image_ref)
@@ -104,8 +137,14 @@ class MaxSlotPublisher:
                 return self._error(exc)
         message = sanitize_html(text)
         if to_admins:
-            return await self._publish_to_admins(message, attachments)
-        return await self._publish_to_channel(chat_id, message, attachments)
+            result = await self._publish_to_admins(message, attachments)
+        else:
+            result = await self._publish_to_channel(chat_id, message, attachments)
+        if result.success and is_generated_ref:
+            # confirmed publish (retries already happened inside): the
+            # image is gone from the message, so is the file
+            await self._delete_generated_image(image_ref)
+        return result
 
     # --- postcard ---------------------------------------------------------------
 
@@ -119,7 +158,10 @@ class MaxSlotPublisher:
         infra. A bare type ref (``rubric.image`` of a generative rubric)
         selects the least-shown card here and rotates the stock; a
         concrete ``bank:<type>/<id>`` ref was already marked shown by the
-        bank pipeline that picked it."""
+        bank pipeline that picked it. ``generated:<file>`` refs are read
+        from the generated-images directory instead of the bank."""
+        if image_ref.strip().startswith(_GENERATED_REF_PREFIX):
+            return await self._generated_attachments(image_ref)
         item = await resolve_postcard(self._bank, image_ref)
         if item is None:
             logger.warning(
@@ -139,6 +181,56 @@ class MaxSlotPublisher:
             return None
         token = await self._uploader.upload_image(data, filename, content_type)
         return [image_attachment(token)]
+
+    async def _generated_attachments(
+        self, image_ref: str
+    ) -> list[dict[str, Any]] | None:
+        """Attachment payload for a generated slot image, or None for text-only.
+
+        Reads ``generated:<file>`` from the generated-images directory
+        under the same path-traversal guard as the bank postcards; a
+        missing file, an escaping reference or a non-image extension is a
+        local problem and degrades to None, while upload/transport errors
+        propagate as infra (dual-channel plan §3.4)."""
+        name = image_ref.strip()[len(_GENERATED_REF_PREFIX) :].strip()
+        if self._generated_dir is None or not _is_bare_name(name):
+            logger.warning(
+                "slot_generated_ref_rejected image_ref=%s image=none", image_ref
+            )
+            return None
+        content_type = _GENERATED_CONTENT_TYPES.get(Path(name).suffix.lower())
+        if content_type is None:
+            logger.warning(
+                "slot_generated_bad_extension image_ref=%s image=none", image_ref
+            )
+            return None
+        full_path = self._generated_dir / name
+        try:
+            data = await asyncio.to_thread(full_path.read_bytes)
+        except OSError as exc:
+            logger.warning(
+                "slot_generated_unreadable image_ref=%s error=%s", image_ref, exc
+            )
+            return None
+        token = await self._uploader.upload_image(data, name, content_type)
+        return [image_attachment(token)]
+
+    async def _delete_generated_image(self, image_ref: str) -> None:
+        """Best-effort removal after a confirmed publish (plan §3.3).
+
+        A failed unlink never fails the already-successful publish: the
+        daily backup TTL-prune is the safety net for leftovers."""
+        name = image_ref.strip()[len(_GENERATED_REF_PREFIX) :].strip()
+        if self._generated_dir is None or not _is_bare_name(name):
+            return
+        full_path = self._generated_dir / name
+        try:
+            await asyncio.to_thread(full_path.unlink)
+            logger.info("generated_image_deleted path=%s", full_path)
+        except OSError as exc:
+            logger.warning(
+                "generated_image_delete_failed path=%s error=%s", full_path, exc
+            )
 
     # --- sending ------------------------------------------------------------------
 

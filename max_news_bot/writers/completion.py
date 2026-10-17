@@ -68,6 +68,7 @@ class LlmCompletionClient:
         timeout: int,
         max_tokens: int,
         temperature: float,
+        disable_reasoning: bool = False,
         session: aiohttp.ClientSession | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
@@ -76,6 +77,7 @@ class LlmCompletionClient:
         self._timeout = timeout
         self._max_tokens = max_tokens
         self._temperature = temperature
+        self._disable_reasoning = disable_reasoning
         # Shared process-wide session wins; otherwise one per call.
         self._session = session
 
@@ -90,6 +92,10 @@ class LlmCompletionClient:
             "max_tokens": self._max_tokens,
             "temperature": self._temperature,
         }
+        if self._disable_reasoning:
+            # thinking models on OpenRouter otherwise burn the whole
+            # max_tokens budget on reasoning and return content=null
+            payload["reasoning"] = {"enabled": False}
         headers = {
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",

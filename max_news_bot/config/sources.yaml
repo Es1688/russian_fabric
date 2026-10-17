@@ -22,7 +22,8 @@ sources:
 
 # Второй цикл бота: контент-фабрика (LLM переписывает новости в посты).
 # Стартуем ВЫКЛЮЧЕННОЙ: включение — FACTORY_ENABLED=true в .env вместе с
-# LLM_API_KEY, чтобы существующий деплой не упал после мержа без новых
+# OPENROUTER_API_KEY и LLM_API_KEY (оба LLM-канала обязательны при активном
+# LLM-контуре), чтобы существующий деплой не упал после мержа без новых
 # секретов. dry_run: true — посты уходят админам в личку со статусом
 # previewed, в канал не публикуются. Перевод в канал — только после
 # раскатки (план задачи, шаг 5).
@@ -44,14 +45,26 @@ factory:
   include_keywords: []
   exclude_keywords: []
   llm:
-    base_url: "https://ai.api.cloud.yandex.net/v1"
-    # Yandex AI Studio: модель — полный URI gpt://<folder_id>/<model>.
-    # FOLDER_ID — заглушка: заменить на реальный id каталога Yandex Cloud
-    # (или задать модель целиком через переменную окружения LLM_MODEL).
-    model: "gpt://FOLDER_ID/yandexgpt-5-lite"
+    # Первичный LLM-канал: OpenRouter (OpenAI-совместимый API).
+    # Ключ — только в .env: OPENROUTER_API_KEY.
+    base_url: "https://openrouter.ai/api/v1"
+    model: "qwen/qwen3.8-flash"
+    # Thinking-модель иначе тратит весь max_tokens на рассуждения и
+    # возвращает пустой content — reasoning отключается в payload запроса.
+    disable_reasoning: true
     timeout: 60
     max_tokens: 800
     temperature: 0.7
+  llm_fallback:
+    # Резервный LLM-канал: Yandex AI Studio (OpenAI-совместимый API).
+    # Ключ — только в .env: LLM_API_KEY (он же обслуживает YandexART).
+    # Timeout/max_tokens/temperature общие с первичным каналом.
+    base_url: "https://ai.api.cloud.yandex.net/v1"
+    # Модель — полный URI gpt://<folder_id>/<model>. FOLDER_ID — заглушка:
+    # заменить на реальный id каталога Yandex Cloud (или задать модель
+    # целиком через переменную окружения LLM_FALLBACK_MODEL).
+    model: "gpt://FOLDER_ID/yandexgpt-5-lite"
+    disable_reasoning: false
   prompt: |
     Ты — редактор канала об IT и технологиях. По новости, переданной
     пользователем внутри тегов <article>…</article>, ты пишешь один пост для канала.

@@ -51,6 +51,11 @@ def test_shipped_config_loads(rubrics_env: None) -> None:
     assert config.timezone == "Europe/Moscow"
     assert "старшего возраста" in config.persona
     assert "тёплые цвета" in config.image_style
+    # image generation section (dual-channel plan section 3): fal is the
+    # active provider, yandex_art is reserved as a stub
+    assert config.image_generation.fal.model == "fal-ai/flux/dev"
+    assert config.image_generation.yandex_art.size == "1024x1024"
+    assert config.image_generation.timeout_seconds == 120
     assert config.daily_cap == 6
     # daily summary slot (plan section 11): 22:40, after the last 21:30 post
     assert config.summary_time == "22:40"
@@ -400,6 +405,142 @@ def test_summary_time_invalid_rejected(rubrics_env: None, tmp_path: Path) -> Non
         _load_with(tmp_path, 'summary_time: "9:99"\n' + MINIMAL_YAML)
 
 
+# --- image_generation section (dual-channel plan section 3.2) -------------------
+
+# A rubric switched to generated images; the reserved word rides on a bank
+# rubric on purpose: bank type names live in the DB, not in the config.
+GENERATE_YAML = MINIMAL_YAML.replace(
+    "kind: bank", "kind: bank\n    image: generate"
+)
+
+
+def test_image_generation_defaults_without_section(
+    rubrics_env: None, tmp_path: Path
+) -> None:
+    # the section is optional: without it the defaults apply (and only a
+    # rubric with image: generate makes them matter)
+    config = load_rubrics_config(_write_config(tmp_path, MINIMAL_YAML))
+
+    assert config.image_generation.fal.model == "fal-ai/flux/dev"
+    assert config.image_generation.yandex_art.size == "1024x1024"
+    assert config.image_generation.timeout_seconds == 120
+
+
+def test_image_generation_section_parsed(
+    rubrics_env: None, tmp_path: Path
+) -> None:
+    # the top-level key is whitelisted (an unknown top key still fails) and
+    # every sub-section carries its own default
+    content = (
+        "image_generation:\n"
+        "  fal:\n"
+        '    model: fal-ai/flux/schnell\n'
+        "  yandex_art:\n"
+        '    size: "512x512"\n'
+        "  timeout_seconds: 60\n"
+    ) + MINIMAL_YAML
+
+    config = load_rubrics_config(_write_config(tmp_path, content))
+
+    assert config.image_generation.fal.model == "fal-ai/flux/schnell"
+    assert config.image_generation.yandex_art.size == "512x512"
+    assert config.image_generation.timeout_seconds == 60
+
+
+@pytest.mark.parametrize(
+    "section",
+    [
+        "image_generation:\n  fal:\n    modle: x\n",  # typo inside fal
+        "image_generation:\n  yandex_art:\n    dimensions: x\n",  # typo inside stub
+        "image_generation:\n  ollama: {}\n",  # unknown provider
+        "image_generation: 120\n",  # not a mapping
+        "image_generation:\n  timeout_seconds: nope\n",  # not an integer
+        "image_generation:\n  timeout_seconds: 0\n",  # not positive
+    ],
+)
+def test_image_generation_malformed_fails(
+    rubrics_env: None, tmp_path: Path, section: str
+) -> None:
+    with pytest.raises(RubricsConfigError):
+        _load_with(tmp_path, section + MINIMAL_YAML)
+
+
+def test_image_generate_rubric_valid(
+    rubrics_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAL_KEY", "test-fal-key")
+
+    config = load_rubrics_config(_write_config(tmp_path, GENERATE_YAML))
+
+    assert config.rubrics[0].image == "generate"
+
+
+def test_generate_image_without_fal_key_fails(
+    rubrics_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # fail-fast (plan section 3.2): the missing key aborts the launch, it
+    # does not degrade the slot to a text-only post silently
+    monkeypatch.delenv("FAL_KEY", raising=False)
+
+    with pytest.raises(RubricsConfigError, match="FAL_KEY"):
+        _load_with(tmp_path, GENERATE_YAML)
+
+
+def test_generate_image_disabled_rubric_needs_no_key(
+    rubrics_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # a disabled rubric never runs, so it does not bind the deploy env
+    monkeypatch.delenv("FAL_KEY", raising=False)
+    content = GENERATE_YAML.replace(
+        "kind: bank", "enabled: false\n    kind: bank"
+    )
+
+    config = load_rubrics_config(_write_config(tmp_path, content))
+
+    assert config.rubrics[0].enabled is False
+
+
+def test_yandex_art_section_alone_needs_no_key(
+    rubrics_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the stub is parsed and validated but never activates a provider and
+    # requires no key until the real client lands
+    monkeypatch.delenv("FAL_KEY", raising=False)
+    content = (
+        'image_generation:\n  yandex_art:\n    size: "512x512"\n' + MINIMAL_YAML
+    )
+
+    config = load_rubrics_config(_write_config(tmp_path, content))
+
+    assert config.image_generation.yandex_art.size == "512x512"
+
+
+def test_generate_with_yandex_art_only_still_requires_fal_key(
+    rubrics_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the reserved yandex_art section cannot cover the requirement: fal is
+    # the only active provider (priority is fixed fal -> yandex_art)
+    monkeypatch.delenv("FAL_KEY", raising=False)
+    content = (
+        'image_generation:\n  yandex_art:\n    size: "512x512"\n' + GENERATE_YAML
+    )
+
+    with pytest.raises(RubricsConfigError, match="FAL_KEY"):
+        _load_with(tmp_path, content)
+
+
+def test_bank_image_rubrics_need_no_section_or_key(
+    rubrics_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # postcard bank rubrics and no-image rubrics stay key-free
+    monkeypatch.delenv("FAL_KEY", raising=False)
+    content = MINIMAL_YAML.replace("kind: bank", "kind: bank\n    image: postcard")
+
+    config = load_rubrics_config(_write_config(tmp_path, content))
+
+    assert config.rubrics[0].image == "postcard"
+
+
 # --- startup integration via load_config --------------------------------------
 
 
@@ -410,6 +551,9 @@ def app_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MAX_CHANNEL_ID", "-1001234567890")
     monkeypatch.setenv("ADMIN_IDS", "111,222")
     monkeypatch.setenv("LLM_API_KEY", "test-llm-key")
+    # dual-channel fail-fast in load_config: an active LLM contour requires
+    # both the primary OpenRouter key and the Yandex fallback key
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
     monkeypatch.delenv("FACTORY_ENABLED", raising=False)
     monkeypatch.delenv("RUBRICS_ENABLED", raising=False)
     monkeypatch.delenv("RUBRICS_CONFIG_PATH", raising=False)
@@ -482,6 +626,24 @@ def test_load_config_rubrics_without_enabled_rubrics_fails(
     )
 
     with pytest.raises(ValueError, match="no enabled rubrics"):
+        load_config()
+
+
+def test_load_config_generate_image_without_fal_key_fails(
+    app_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # startup integration (dual-channel plan section 3.2): an enabled
+    # image: generate rubric aborts load_config without FAL_KEY
+    monkeypatch.setenv("FACTORY_ENABLED", "false")
+    monkeypatch.setenv("RUBRICS_ENABLED", "true")
+    monkeypatch.delenv("FAL_KEY", raising=False)
+    monkeypatch.setenv(
+        "RUBRICS_CONFIG_PATH", str(_write_config(tmp_path, GENERATE_YAML))
+    )
+
+    # RubricsConfigError is a ValueError subclass: same startup contract as
+    # the LLM-key fail-fast above
+    with pytest.raises(ValueError, match="FAL_KEY"):
         load_config()
 
 

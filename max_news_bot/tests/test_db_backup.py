@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -19,6 +20,7 @@ import pytest
 
 from max_news_bot.bot.db_backup import (
     BACKUP_EVENT,
+    GENERATED_TTL_DAYS,
     DailyBackupService,
     daily_backup_loop,
 )
@@ -159,6 +161,38 @@ async def test_prune_keeps_last_n_copies(db: Database, tmp_path: Path) -> None:
 async def test_invalid_keep_rejected(db: Database) -> None:
     with pytest.raises(ValueError, match="keep"):
         DailyBackupService(db, keep=0)
+
+
+# --- generated images TTL-prune (dual-channel plan §3.3) ------------------------
+
+
+async def test_generated_prune_removes_only_old_png_files(
+    db: Database, tmp_path: Path
+) -> None:
+    generated = tmp_path / "generated"
+    generated.mkdir()
+    old, fresh, foreign = (
+        generated / "101.png",
+        generated / "102.png",
+        generated / "notes.txt",
+    )
+    for path in (old, fresh, foreign):
+        path.write_bytes(b"x")
+    stale = (datetime.now(timezone.utc) - timedelta(days=GENERATED_TTL_DAYS + 1)).timestamp()
+    os.utime(old, (stale, stale))
+    os.utime(foreign, (stale, stale))  # old but not this contour's file
+
+    service = DailyBackupService(db, directory=tmp_path / "backups", generated_dir=generated)
+    assert await service.backup_if_due(now=at_backup_slot()) is True
+
+    assert not old.exists()  # older than the TTL: gone
+    assert fresh.exists()  # young: untouched
+    assert foreign.exists()  # only *.png files are this service's business
+
+
+async def test_generated_dir_defaults_next_to_the_database(db: Database) -> None:
+    service = DailyBackupService(db, directory=db.path.parent / "backups")
+    assert service.generated_dir == db.path.parent / "generated"
 
 
 async def test_loop_shields_failure_and_alerts(db: Database) -> None:

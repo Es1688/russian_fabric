@@ -10,6 +10,12 @@ fixed slot window (default 23:10 Europe/Moscow - after the 22:40 summary,
 before the day turns), record the done day as a bot_stats event and skip it
 on a restart, so the backup is never duplicated. Old copies are pruned to
 the last ``keep`` days.
+
+The same daily maintenance is the TTL safety net for generated slot images
+(dual-channel plan §3.3): the publisher deletes ``data/generated`` files
+right after the confirmed publish, and this service removes whatever is
+older than ``GENERATED_TTL_DAYS`` - leftovers of failed publishes and dead
+slot runs.
 """
 
 from __future__ import annotations
@@ -37,6 +43,9 @@ DEFAULT_BACKUP_TIME = "23:10"
 BACKUP_GRACE_MINUTES = 30
 BACKUP_TICK_SECONDS = 60.0
 DEFAULT_KEEP_BACKUPS = 7
+# TTL of generated slot images (dual-channel plan §3.3): the publisher
+# deletes the file on confirmed publish, this bounds crash leftovers.
+GENERATED_TTL_DAYS = 7
 
 # Backup file names this service owns inside its directory: stem + ISO date.
 _BACKUP_NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.db$")
@@ -50,6 +59,7 @@ class DailyBackupService:
         db: Database,
         *,
         directory: Path | None = None,
+        generated_dir: Path | None = None,
         tz_name: str = "Europe/Moscow",
         backup_time: str = DEFAULT_BACKUP_TIME,
         keep: int = DEFAULT_KEEP_BACKUPS,
@@ -58,6 +68,9 @@ class DailyBackupService:
         self._db = db
         self._directory = (
             directory if directory is not None else db.path.parent / "backups"
+        )
+        self._generated_dir = (
+            generated_dir if generated_dir is not None else db.path.parent / "generated"
         )
         self._tz = ZoneInfo(tz_name)
         self._hour, self._minute = parse_summary_time(backup_time)
@@ -70,6 +83,11 @@ class DailyBackupService:
     def directory(self) -> Path:
         """Directory the backup files are written to."""
         return self._directory
+
+    @property
+    def generated_dir(self) -> Path:
+        """Directory of generated slot images pruned by TTL."""
+        return self._generated_dir
 
     async def backup_if_due(self, now: datetime | None = None) -> bool:
         """Take the backup when the local time is inside today's slot window.
@@ -93,6 +111,7 @@ class DailyBackupService:
         dest = self._directory / f"{self._db.path.stem}-{day}.db"
         created = await self._backup(dest)
         await self._prune()
+        await self._prune_generated()
         await self._db.log_event(BACKUP_EVENT, f"{day} file={dest.name}")
         if not created:
             logger.info("db_backup_already_present date=%s", day)
@@ -141,6 +160,28 @@ class DailyBackupService:
                 logger.info("db_backup_pruned path=%s", path)
             except OSError as exc:
                 logger.error("db_backup_prune_failed path=%s error=%s", path, exc)
+
+    async def _prune_generated(self) -> None:
+        await asyncio.to_thread(self._prune_generated_sync)
+
+    def _prune_generated_sync(self) -> None:
+        """Remove generated images older than GENERATED_TTL_DAYS.
+
+        Only the ``*.png`` files this contour writes are touched (mtime is
+        the age signal - run ids carry no date); any other file in the
+        directory is left alone, like with the backup prune."""
+        if not self._generated_dir.exists():
+            return
+        cutoff = self._clock().timestamp() - GENERATED_TTL_DAYS * 24 * 60 * 60
+        for path in self._generated_dir.glob("*.png"):
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+                    logger.info("generated_image_pruned path=%s", path)
+            except OSError as exc:
+                logger.error(
+                    "generated_image_prune_failed path=%s error=%s", path, exc
+                )
 
 
 async def daily_backup_loop(

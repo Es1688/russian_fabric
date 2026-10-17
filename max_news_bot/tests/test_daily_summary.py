@@ -91,6 +91,17 @@ async def _claim(
     await env.runs.save(replace(run, status=status, **overrides))
 
 
+def _log_stats_event(env: SimpleNamespace, event: str, created_at: str) -> None:
+    # bot_stats row with an explicit UTC created_at (log_event would stamp
+    # it "now", which is outside the tested summary day)
+    with sqlite3.connect(env.path) as conn:
+        conn.execute(
+            "INSERT INTO bot_stats (event, details, created_at) VALUES (?, '', ?)",
+            (event, created_at),
+        )
+        conn.commit()
+
+
 # --- message body -----------------------------------------------------------------
 
 
@@ -234,6 +245,56 @@ async def test_build_text_llm_estimate_counts_attempts_and_filters(
     # 3 digest attempts + 1 generative attempt are LLM calls; the bank
     # rubric's 2 attempts are not
     assert "LLM-вызовы (оценка): 6 — слоты 4, фильтры 2" in text
+
+
+# --- channel counters line (plan section 2.6) ---------------------------------------
+
+
+async def test_build_text_channel_line_counts_events_of_the_day(
+    summary_db,
+) -> None:
+    # local day 2026-10-09 (MSK) = [2026-10-08 21:00, 2026-10-09 21:00) UTC
+    inside = "2026-10-09 10:00:00"
+    for event, count in (
+        ("llm_primary_ok", 2),
+        ("llm_fallback_used", 1),
+        ("image_fal_ok", 1),
+        ("image_none", 3),
+    ):
+        for _ in range(count):
+            _log_stats_event(summary_db, event, inside)
+    _log_stats_event(summary_db, "publish", inside)  # unrelated event
+
+    text = await _service(summary_db).build_text(SLOT_DATE)
+
+    lines = text.splitlines()
+    estimate = next(
+        index for index, line in enumerate(lines) if line.startswith("LLM-вызовы")
+    )
+    assert lines[estimate + 1] == (
+        "LLM: primary 2 / fallback 1; картинки: fal 1 / без картинки 3"
+    )
+
+
+async def test_build_text_channel_line_ignores_other_dates(summary_db) -> None:
+    # just before the local day starts ...
+    _log_stats_event(summary_db, "llm_primary_ok", "2026-10-08 20:59:59")
+    _log_stats_event(summary_db, "image_none", "2026-10-08 12:00:00")
+    # ... and at/after the moment it ends: none of them count
+    _log_stats_event(summary_db, "llm_fallback_used", "2026-10-09 21:00:00")
+    _log_stats_event(summary_db, "image_fal_ok", "2026-10-10 12:00:00")
+
+    text = await _service(summary_db).build_text(SLOT_DATE)
+
+    assert "LLM: primary 0 / fallback 0; картинки: fal 0 / без картинки 0" in text
+
+
+async def test_build_text_channel_line_with_zero_stats_is_meaningful(
+    summary_db,
+) -> None:
+    text = await _service(summary_db).build_text(SLOT_DATE)
+
+    assert "LLM: primary 0 / fallback 0; картинки: fal 0 / без картинки 0" in text
 
 
 # --- delivery window and once-a-day rule -------------------------------------------

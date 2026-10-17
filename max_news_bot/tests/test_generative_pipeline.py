@@ -23,9 +23,12 @@ from max_news_bot.config.rubrics import (
     WEEKDAYS,
 )
 from max_news_bot.core.models import ContentBankItem
+from max_news_bot.images.base import ImageGenerationError
+from max_news_bot.images.fallback import FallbackImageGenerator
 from max_news_bot.rubrics.generative import (
     LLM_CALLS_PER_SLOT,
     GenerativePipeline,
+    build_image_prompt,
     parse_checker_answer,
 )
 from max_news_bot.utils.db import Database
@@ -100,6 +103,8 @@ SEED_FACT = "Запись банка: блокада Ленинграда дли
 SEED_EVENT = (
     "Событие этого дня из банка: календарная запись с датой десять-девять."
 )
+IMAGE_STYLE = "Тёплые цвета, крупные элементы, высокий контраст."
+PNG_BYTES = b"\x89PNG\r\n\x1a\n fake generated image bytes"
 
 
 class MockLlm:
@@ -125,6 +130,21 @@ class MockLlm:
     @property
     def call_count(self) -> int:
         return len(self.calls)
+
+
+class MockImageGenerator:
+    """ImageGenerator double: scripted bytes / errors, prompts recorded."""
+
+    def __init__(self, script: list[Any]) -> None:
+        self._script = list(script)
+        self.prompts: list[str] = []
+
+    async def generate(self, prompt: str) -> bytes:
+        self.prompts.append(prompt)
+        item = self._script.pop(0) if len(self._script) > 1 else self._script[0]
+        if isinstance(item, BaseException):
+            raise item
+        return item
 
 
 class RecordingPublisher:
@@ -191,13 +211,16 @@ def make_rubric(
 
 
 def make_config(
-    rubrics: list[RubricConfig], *, persona: str = PERSONA
+    rubrics: list[RubricConfig],
+    *,
+    persona: str = PERSONA,
+    image_style: str = "",
 ) -> RubricsConfig:
     return RubricsConfig(
         enabled=True,
         timezone="UTC",
         persona=persona,
-        image_style="",
+        image_style=image_style,
         targets={"main": TargetConfig(name="main", channel_id=MAIN_CHAT)},
         daily_cap=6,
         weather_points=(),
@@ -211,13 +234,22 @@ def make_pipeline(
     llm: MockLlm,
     *,
     persona: str = PERSONA,
+    image_style: str = "",
+    images: FallbackImageGenerator | None = None,
+    generated_dir: Path | None = None,
+    db: Database | None = None,
+    alerter: MockAlerter | None = None,
 ) -> GenerativePipeline:
     return GenerativePipeline(
-        make_config(rubrics, persona=persona),
+        make_config(rubrics, persona=persona, image_style=image_style),
         llm,
         ContentBankRepository(path),
         SlotRunRepository(path),
         FilterLogRepository(path),
+        images=images,
+        generated_dir=generated_dir,
+        db=db,
+        alerter=alerter,
     )
 
 
@@ -294,6 +326,19 @@ def test_find_cliche_phrase() -> None:
     assert find_cliche_phrase("Как говорится, день прошёл") is not None
     assert find_cliche_phrase("Само собой разумеется, что это так") is not None
     assert find_cliche_phrase(GOOD_TEXT) is None
+
+
+def test_build_image_prompt_style_plus_topic() -> None:
+    prompt = build_image_prompt("  Стиль.  ", "Тема\n   дня.")
+    assert prompt == "Стиль.\nТема дня."
+    assert build_image_prompt("", "Тема.") == "Тема."
+    assert build_image_prompt("Стиль.", "") == "Стиль."
+
+
+def test_build_image_prompt_capped_at_500_chars() -> None:
+    prompt = build_image_prompt("x" * 450, "y" * 300)
+    assert len(prompt) == 500
+    assert prompt.startswith("x")
 
 
 # --- one attempt: prompt, validators, checker ---
@@ -714,6 +759,239 @@ async def test_fallback_post_length_validated(db_path: Path) -> None:
 def test_unknown_validator_name_aborts_startup(db_path: Path) -> None:
     with pytest.raises(ValueError, match="bogus"):
         make_pipeline(db_path, [make_rubric(validators=("length", "bogus"))], MockLlm())
+
+
+# --- generated images: image: generate (dual-channel plan §3.3) ---
+
+
+@pytest.mark.asyncio
+async def test_image_generate_writes_file_and_generated_ref(
+    db_path: Path, tmp_path: Path
+) -> None:
+    rubric = make_rubric(image="generate")
+    await add_bank_item(db_path, "thought", SEED_THOUGHT_A)
+    generator = MockImageGenerator([PNG_BYTES])
+    generated_dir = tmp_path / "generated"
+    db = Database(db_path)
+    pipeline = make_pipeline(
+        db_path,
+        [rubric],
+        MockLlm([GOOD_TEXT, "нет"]),
+        image_style=IMAGE_STYLE,
+        images=FallbackImageGenerator(generator, None),
+        generated_dir=generated_dir,
+        db=db,
+    )
+    run = await claim_run(db_path, "good_night", "2026-10-09")
+
+    outcome = await pipeline.generate(rubric, run, now=NOW)
+
+    assert outcome.status == "generated"
+    assert outcome.image_ref == f"generated:{run.id}.png"
+    assert outcome.alert is None
+    assert (generated_dir / f"{run.id}.png").read_bytes() == PNG_BYTES
+    # deterministic prompt, no LLM round: style + first ~200 chars of the post
+    assert generator.prompts == [f"{IMAGE_STYLE}\n{GOOD_TEXT[:200]}"]
+    assert all(len(prompt) <= 500 for prompt in generator.prompts)
+    event = await db.get_last_event("image_fal_ok")
+    assert event is not None and f"run={run.id}" in event["details"]
+    assert await db.get_last_event("image_none") is None
+
+
+@pytest.mark.asyncio
+async def test_image_failure_degrades_to_text_only_with_alert_and_event(
+    db_path: Path, tmp_path: Path
+) -> None:
+    # fal fails with no fallback wired: text-only post + alert + event
+    rubric = make_rubric(image="generate")
+    await add_bank_item(db_path, "thought", SEED_THOUGHT_A)
+    db = Database(db_path)
+    alerter = MockAlerter()
+    pipeline = make_pipeline(
+        db_path,
+        [rubric],
+        MockLlm([GOOD_TEXT, "нет"]),
+        images=FallbackImageGenerator(
+            MockImageGenerator([ImageGenerationError("infra", "fal http 500")]), None
+        ),
+        generated_dir=tmp_path / "generated",
+        db=db,
+        alerter=alerter,
+    )
+
+    outcome = await pipeline.generate(
+        rubric, await claim_run(db_path, "good_night", "2026-10-09"), now=NOW
+    )
+
+    # a broken picture must not fail the slot
+    assert outcome.status == "generated"
+    assert outcome.text == GOOD_TEXT
+    assert outcome.image_ref is None
+    assert outcome.alert is not None and "generation failed" in outcome.alert
+    event = await db.get_last_event("image_none")
+    assert event is not None and "kind=infra" in event["details"]
+    assert alerter.alerts == []  # infra failures stay in logs and the summary
+
+
+@pytest.mark.asyncio
+async def test_image_config_error_alerts_admins_once_per_day(
+    db_path: Path, tmp_path: Path
+) -> None:
+    rubric = make_rubric(image="generate")
+    await add_bank_item(db_path, "thought", SEED_THOUGHT_A)
+    db = Database(db_path)
+    alerter = MockAlerter()
+    pipeline = make_pipeline(
+        db_path,
+        [rubric],
+        MockLlm([GOOD_TEXT, "нет", GOOD_TEXT, "нет"]),
+        images=FallbackImageGenerator(
+            MockImageGenerator([ImageGenerationError("config", "fal http 401")]), None
+        ),
+        generated_dir=tmp_path / "generated",
+        db=db,
+        alerter=alerter,
+    )
+
+    first = await pipeline.generate(
+        rubric, await claim_run(db_path, "good_night", "2026-10-09"), now=NOW
+    )
+    second = await pipeline.generate(
+        rubric, await claim_run(db_path, "good_night", "2026-10-10"), now=NOW
+    )
+
+    assert first.image_ref is None and second.image_ref is None
+    assert first.alert and second.alert  # both slots carry the outcome alert
+    assert len(alerter.alerts) == 1  # the immediate admin alert is deduped
+    assert "401" in alerter.alerts[0]
+    event = await db.get_last_event("image_none")
+    assert event is not None and "kind=config" in event["details"]
+
+
+class _FlakyAlerter(MockAlerter):
+    """Delivery double failing the first send, then recording normally."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._failures = 1
+
+    async def send_alert(self, text: str) -> None:
+        if self._failures > 0:
+            self._failures -= 1
+            raise RuntimeError("max is unreachable")
+        await super().send_alert(text)
+
+
+@pytest.mark.asyncio
+async def test_image_config_alert_retries_after_delivery_failure(
+    db_path: Path, tmp_path: Path
+) -> None:
+    rubric = make_rubric(image="generate")
+    await add_bank_item(db_path, "thought", SEED_THOUGHT_A)
+    db = Database(db_path)
+    alerter = _FlakyAlerter()
+    pipeline = make_pipeline(
+        db_path,
+        [rubric],
+        MockLlm([GOOD_TEXT, "нет", GOOD_TEXT, "нет"]),
+        images=FallbackImageGenerator(
+            MockImageGenerator(
+                [
+                    ImageGenerationError("config", "fal http 401"),
+                    ImageGenerationError("config", "fal http 401"),
+                ]
+            ),
+            None,
+        ),
+        generated_dir=tmp_path / "generated",
+        db=db,
+        alerter=alerter,
+    )
+
+    first = await pipeline.generate(
+        rubric, await claim_run(db_path, "good_night", "2026-10-09"), now=NOW
+    )
+    assert first.image_ref is None  # text-only degradation, slot survives
+    assert alerter.alerts == []  # the delivery itself failed
+
+    second = await pipeline.generate(
+        rubric, await claim_run(db_path, "good_night", "2026-10-10"), now=NOW
+    )
+    assert second.image_ref is None
+    # the failed delivery must not consume the daily dedup: the retry lands
+    assert len(alerter.alerts) == 1
+    assert "401" in alerter.alerts[0]
+
+
+@pytest.mark.asyncio
+async def test_fallback_generator_rescues_the_image(
+    db_path: Path, tmp_path: Path
+) -> None:
+    """Contract for the future second provider: a wired reserve saves the
+    picture, the wiring itself does not change (dual-channel plan §3.5)."""
+    rubric = make_rubric(image="generate")
+    await add_bank_item(db_path, "thought", SEED_THOUGHT_A)
+    db = Database(db_path)
+    generated_dir = tmp_path / "generated"
+    pipeline = make_pipeline(
+        db_path,
+        [rubric],
+        MockLlm([GOOD_TEXT, "нет"]),
+        images=FallbackImageGenerator(
+            MockImageGenerator([ImageGenerationError("infra", "fal http 500")]),
+            MockImageGenerator([PNG_BYTES]),
+        ),
+        generated_dir=generated_dir,
+        db=db,
+    )
+    run = await claim_run(db_path, "good_night", "2026-10-09")
+
+    outcome = await pipeline.generate(rubric, run, now=NOW)
+
+    assert outcome.status == "generated"
+    assert outcome.image_ref == f"generated:{run.id}.png"
+    assert outcome.alert is None
+    assert (generated_dir / f"{run.id}.png").read_bytes() == PNG_BYTES
+    assert await db.get_last_event("image_fal_ok") is not None
+
+
+@pytest.mark.asyncio
+async def test_fallback_post_with_image_generate(db_path: Path, tmp_path: Path) -> None:
+    rubric = make_rubric(image="generate")
+    await add_bank_item(db_path, "reserve", RESERVE_TEXT)
+    generated_dir = tmp_path / "generated"
+    pipeline = make_pipeline(
+        db_path,
+        [rubric],
+        MockLlm(),
+        images=FallbackImageGenerator(MockImageGenerator([PNG_BYTES]), None),
+        generated_dir=generated_dir,
+    )
+    run = await claim_run(db_path, "good_night", "2026-10-09")
+
+    outcome = await pipeline.fallback_post(rubric, run, now=NOW)
+
+    assert outcome.status == "generated"
+    assert outcome.text == RESERVE_TEXT
+    assert outcome.image_ref == f"generated:{run.id}.png"
+    assert (generated_dir / f"{run.id}.png").exists()
+
+
+@pytest.mark.asyncio
+async def test_image_generate_without_wired_generator_degrades_with_alert(
+    db_path: Path,
+) -> None:
+    rubric = make_rubric(image="generate")
+    await add_bank_item(db_path, "thought", SEED_THOUGHT_A)
+    pipeline = make_pipeline(db_path, [rubric], MockLlm([GOOD_TEXT, "нет"]))
+
+    outcome = await pipeline.generate(
+        rubric, await claim_run(db_path, "good_night", "2026-10-09"), now=NOW
+    )
+
+    assert outcome.status == "generated"
+    assert outcome.image_ref is None
+    assert outcome.alert is not None and "generation failed" in outcome.alert
 
 
 # --- completion client (real HTTP against a local fake server) ---

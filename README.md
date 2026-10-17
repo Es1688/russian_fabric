@@ -4,16 +4,16 @@
 и публикует в канал. В репозитории два взаимоисключающих контура публикации:
 
 - **Legacy (по умолчанию)** — дайджест-цикл RSS (Habr, vc.ru по ключевым словам) и
-  контент-фабрика: оригинальные посты через Yandex AI Studio (OpenAI-совместимый
-  API, `yandexgpt-5-lite`).
+  контент-фабрика: оригинальные посты через двухканальный LLM — OpenRouter
+  (первичный канал) с per-request failover на Yandex GPT (резерв).
 - **Автономный канал рубрик** (`RUBRICS_ENABLED=true`) — суточная сетка рубрик для
   аудитории старшего возраста СПб и Ленобласти: слотовый планировщик, банк
   контента, погода, «хорошие новости» с LLM-фильтрами, наблюдаемость. Реализован
   по плану [docs/plans/2026-10-09-autonomous-channel.md](docs/plans/2026-10-09-autonomous-channel.md).
 
 Платформы доставки — российские (MAX, Yandex Cloud): прокси не нужны, бот и LLM
-доступны с VPS в РФ напрямую. Ключевые решения порта — в
-[ARCHITECTURE.md](ARCHITECTURE.md), раздел ADR-001.
+доступны с VPS в РФ напрямую. Ключевые решения порта и двухканального LLM — в
+[ARCHITECTURE.md](ARCHITECTURE.md), разделы ADR-001–ADR-003.
 
 ## Состав репозитория
 
@@ -78,15 +78,35 @@ uv run pytest                                    # тесты
    обязан **один раз написать боту `/start`** — в MAX бот не может инициировать
    личную переписку, без этого не доставятся превью фабрики/рубрик и алерты.
 
-### Yandex AI Studio (LLM: фабрика и рубрики)
+### LLM-каналы (фабрика и рубрики)
 
-1. В [Yandex Cloud](https://console.yandex.cloud) подключите платный
-   **billing-аккаунт** (бесплатного tier нет) и создайте API-ключ AI Studio →
-   `LLM_API_KEY`.
-2. Скопируйте `folder_id` каталога и соберите имя модели → `LLM_MODEL`:
-   `gpt://<folder_id>/yandexgpt-5-lite`.
-3. `LLM_BASE_URL` уже вписан в `.env.example`:
-   `https://ai.api.cloud.yandex.net/v1` (OpenAI-совместимый endpoint).
+Текст постов пишется через двухканальный LLM (ADR-002): каждый вызов сначала
+идёт в первичный канал, при любой ошибке — в резервный (per-request failover
+без состояния, промпт общий).
+
+1. **Первичный канал — OpenRouter**: создайте API-ключ на
+   [openrouter.ai](https://openrouter.ai) → `OPENROUTER_API_KEY`. Дефолтная
+   модель `qwen/qwen3.8-flash` и endpoint уже вписаны в `sources.yaml`;
+   переопределения — `LLM_BASE_URL` / `LLM_MODEL` (не указывайте там Yandex —
+   это молча сделало бы резервный канал первичным).
+2. **Резервный канал — Yandex AI Studio**: в [Yandex Cloud](https://console.yandex.cloud)
+   подключите платный **billing-аккаунт** (бесплатного tier нет), создайте
+   API-ключ AI Studio → `LLM_API_KEY`, скопируйте `folder_id` каталога и
+   соберите имя модели → `LLM_FALLBACK_MODEL`: `gpt://<folder_id>/yandexgpt-5-lite`.
+   Тот же ключ в будущем обслужит генерацию изображений YandexART.
+3. При активном LLM-контуре (фабрика или LLM-рубрики) обязательны **оба** ключа:
+   отсутствие любого роняет запуск с fail-fast ошибкой — тихая работа с одним
+   каналом ломает заявленную отказоустойчивость.
+
+### Изображения (fal.ai)
+
+Рубрика со значением `image: generate` в `rubrics.yaml` генерирует картинку
+через fal.ai (модель `fal-ai/flux/dev`); при сбое генерации пост деградирует
+до текстового, слот не падает. Создайте API-ключ на
+[fal.ai](https://fal.ai) → `FAL_KEY`: он обязателен, если хотя бы одна
+включённая рубрика использует `image: generate` (иначе запуск падает с
+fail-fast ошибкой). Второй провайдер YandexART — зарезервированная заглушка:
+ключа пока не требует (ADR-003).
 
 ## Переменные окружения
 
@@ -101,9 +121,13 @@ uv run pytest                                    # тесты
 | `POST_INTERVAL_HOURS` | интервал дайджест-цикла в часах |
 | `REQUEST_TIMEOUT` | таймаут HTTP-запросов (RSS/MAX/LLM), сек |
 | `DATABASE_PATH` | путь к SQLite (в Docker: `/app/data/max_news_bot.db`) |
-| `LLM_API_KEY` | ключ Yandex AI Studio |
-| `LLM_BASE_URL` | `https://ai.api.cloud.yandex.net/v1` |
-| `LLM_MODEL` | `gpt://<folder_id>/yandexgpt-5-lite` |
+| `OPENROUTER_API_KEY` | ключ OpenRouter — **первичный** LLM-канал |
+| `LLM_API_KEY` | ключ Yandex AI Studio — **резервный** LLM-канал (Yandex GPT); тот же ключ обслужит YandexART |
+| `LLM_BASE_URL` | переопределение базы URL первичного канала (дефолт `https://openrouter.ai/api/v1`) |
+| `LLM_MODEL` | переопределение модели первичного канала (дефолт `qwen/qwen3.8-flash`) |
+| `LLM_FALLBACK_BASE_URL` | база URL резервного канала (дефолт `https://ai.api.cloud.yandex.net/v1`) |
+| `LLM_FALLBACK_MODEL` | модель резервного канала: `gpt://<folder_id>/yandexgpt-5-lite` |
+| `FAL_KEY` | ключ fal.ai — генерация картинок для рубрик с `image: generate`; обязателен при таких рубриках |
 | `FACTORY_ENABLED` | включает/выключает фабрику |
 | `FACTORY_DRY_RUN` | `true` — превью админам, `false` — публикация в канал |
 | `FACTORY_INTERVAL_HOURS` | интервал цикла фабрики в часах |
@@ -112,7 +136,8 @@ uv run pytest                                    # тесты
 | `RUBRICS_DRY_RUN` | dry-run контура рубрик (дефолт `true`): посты уходят админам из `ADMIN_IDS`, а не в канал; при `true` `ADMIN_IDS` обязателен |
 | `RUBRICS_CONFIG_PATH` | путь к yaml рубрик (дефолт `max_news_bot/config/rubrics.yaml`) |
 
-Секреты (`MAX_BOT_TOKEN`, `LLM_API_KEY`) живут только в `.env` и в git не попадают.
+Секреты (`MAX_BOT_TOKEN`, `OPENROUTER_API_KEY`, `LLM_API_KEY`, `FAL_KEY`)
+живут только в `.env` и в git не попадают.
 
 ## Автономный канал рубрик
 
@@ -192,7 +217,8 @@ data-каталога (VPS: `/opt/maxnewsbot/data/postcards/`); импорт с�
 ## Контент-фабрика (legacy)
 
 Второй, независимый от дайджеста цикл: отбор новостей по своим ключевым словам →
-LLM (Yandex AI Studio) переписывает в оригинальный пост → публикация в тот же
+LLM (двухканальный: OpenRouter — первичный, Yandex GPT — резерв, ADR-002)
+переписывает в оригинальный пост → публикация в тот же
 канал MAX. У фабрики свой интервал, своя дедупликация и свои лимиты. При
 `RUBRICS_ENABLED=true` цикл фабрики не стартует. Подробности — в
 [ARCHITECTURE.md](ARCHITECTURE.md), раздел «Контент-фабрика».

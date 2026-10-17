@@ -18,6 +18,16 @@ Facts are never invented (plan sections 6, 7): when the rubric names bank
 types in ``source.bank_types``, one approved item is attached as the only
 material, and the ``numbers_match`` validator verifies that every number in
 the generated text comes from that material.
+
+Images (dual-channel plan §3.3): a rubric with ``image: generate`` gets a
+picture through ``FallbackImageGenerator`` with a deterministic prompt (no
+LLM round): the bytes land in ``data/generated/<slot_run_id>.png`` and the
+outcome carries ``image_ref = "generated:<file>"`` - the file persists, so
+a publish retry reuses it instead of regenerating. Any generation failure
+degrades to a text-only post (warning + bot_stats ``image_none`` + the
+outcome alert line); a config-kind error additionally fires the immediate
+admin alert. The shared ``GeneratedImages`` helper also serves the bank
+pipeline's ``image: generate`` branch.
 """
 
 from __future__ import annotations
@@ -26,13 +36,22 @@ import asyncio
 import re
 from collections import OrderedDict
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from max_news_bot.bot.slot_scheduler import GenerationOutcome
-from max_news_bot.config.rubrics import RubricConfig, RubricsConfig, WEEKDAYS
+from max_news_bot.config.rubrics import (
+    GENERATE_IMAGE,
+    RubricConfig,
+    RubricsConfig,
+    WEEKDAYS,
+)
 from max_news_bot.core.models import ContentBankItem, FilterLogEntry
+from max_news_bot.images.base import ImageGenerationError, ImageGenerator
+from max_news_bot.publishers.alerter import Alerter
+from max_news_bot.utils.db import Database
 from max_news_bot.utils.logging import get_logger
 from max_news_bot.utils.repositories import (
     ContentBankRepository,
@@ -109,6 +128,139 @@ _CHECKER_QUESTION = (
 
 _CHECKER_YES = frozenset({"да", "yes"})
 _CHECKER_NO = frozenset({"нет", "no"})
+
+# Deterministic image prompt (dual-channel plan §3.2): the global style
+# plus the first ~200 chars of the post text, at most 500 chars in total;
+# no LLM round is spent on the picture.
+IMAGE_TOPIC_CHARS = 200
+IMAGE_PROMPT_MAX_CHARS = 500
+
+
+def build_image_prompt(image_style: str, post_text: str) -> str:
+    """Style line plus the collapsed post topic, hard-capped at 500 chars."""
+    topic = " ".join(post_text.split())[:IMAGE_TOPIC_CHARS]
+    prompt = "\n".join(part for part in (image_style.strip(), topic) if part)
+    return prompt[:IMAGE_PROMPT_MAX_CHARS]
+
+
+class GeneratedImages:
+    """Generates and persists slot images (``image: generate``, plan §3.3).
+
+    The bytes go to ``<directory>/<slot_run_id>.png`` and the outcome
+    carries ``image_ref = "generated:<file>"``: the file outlives the
+    attempt, so a publish retry reuses it instead of regenerating (the
+    publisher deletes it after the confirmed publish; the daily backup
+    prunes crash leftovers by TTL).
+
+    A failure never fails the slot: it degrades to a text-only post with
+    a warning, an ``image_none`` bot_stats event and the outcome's alert
+    line (``image_fal_ok`` is logged on success; ``image_art_used``
+    returns together with the real second provider). A config-kind error
+    additionally fires the immediate admin alert - same contract as
+    writers/fallback.py: optional alerter, in-memory dedup of at most one
+    alert per day. fal is the only active provider, so the dedup key is
+    the single "images" channel; the fal/art split returns with the real
+    client. Observability never breaks the slot: event and alert
+    failures are logged and swallowed.
+    """
+
+    def __init__(
+        self,
+        generator: ImageGenerator | None,
+        directory: Path | None,
+        *,
+        image_style: str,
+        db: Database | None = None,
+        alerter: Alerter | None = None,
+    ) -> None:
+        self._generator = generator
+        self._directory = directory
+        self._image_style = image_style
+        self._db = db
+        self._alerter = alerter
+        self._alerted_on: str | None = None  # UTC date of the last config alert
+
+    async def slot_ref(
+        self, rubric: RubricConfig, run, text: str
+    ) -> tuple[str | None, str | None]:
+        """(image_ref, alert) of the slot: a generated ref or the
+        text-only degradation pair."""
+        if run.id is None:  # unclaimed run (defensive): nowhere to persist
+            return await self._degraded(rubric, "infra", "slot run has no id")
+        if self._generator is None or self._directory is None:
+            return await self._degraded(
+                rubric, "config", "no image generator is wired for image: generate"
+            )
+        prompt = build_image_prompt(self._image_style, text)
+        name = f"{run.id}.png"
+        try:
+            data = await self._generator.generate(prompt)
+            await asyncio.to_thread(self._write_sync, name, data)
+        except ImageGenerationError as exc:
+            return await self._degraded(rubric, exc.kind, str(exc))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # a broken double or a disk problem
+            return await self._degraded(rubric, "infra", _safe_error(exc))
+        await self._emit(
+            "image_fal_ok", f"rubric={rubric.id} run={run.id} file={name}"
+        )
+        return f"generated:{name}", None
+
+    # --- internals ----------------------------------------------------------
+
+    def _write_sync(self, name: str, data: bytes) -> None:
+        assert self._directory is not None
+        self._directory.mkdir(parents=True, exist_ok=True)
+        (self._directory / name).write_bytes(data)
+
+    async def _degraded(
+        self, rubric: RubricConfig, kind: str, error: str
+    ) -> tuple[str | None, str | None]:
+        logger.warning(
+            "image_generation_failed rubric=%s kind=%s error=%s",
+            rubric.id,
+            kind,
+            error,
+        )
+        await self._emit(
+            "image_none",
+            f"rubric={rubric.id} kind={kind} "
+            f"error={_truncate(error, _ERROR_MAX_CHARS)}",
+        )
+        if kind == "config":
+            await self._alert_config_error(error)
+        return None, (
+            f"Image generation failed in rubric {rubric.id} ({kind}): "
+            f"{_truncate(error, _ERROR_MAX_CHARS)}; the post goes out "
+            "without a picture."
+        )
+
+    async def _alert_config_error(self, error: str) -> None:
+        if self._alerter is None:
+            return
+        today = datetime.now(timezone.utc).date().isoformat()
+        if self._alerted_on == today:
+            return
+        try:
+            await self._alerter.send_alert(
+                f"Image generation config error ({error}); check FAL_KEY "
+                "and billing. Posts degrade to text-only."
+            )
+        except Exception as exc:
+            # the dedup key stays unset: a failed delivery must not consume
+            # the daily alert, the next config error retries
+            logger.error("image_alert_failed error=%s", exc)
+            return
+        self._alerted_on = today
+
+    async def _emit(self, event: str, details: str) -> None:
+        if self._db is None:
+            return
+        try:
+            await self._db.log_event(event, details)
+        except Exception as exc:
+            logger.error("image_stats_write_failed event=%s error=%s", event, exc)
 
 
 def _safe_error(exc: BaseException) -> str:
@@ -216,12 +368,24 @@ class GenerativePipeline:
         bank: ContentBankRepository,
         runs: SlotRunRepository,
         filter_log: FilterLogRepository,
+        *,
+        images: ImageGenerator | None = None,
+        generated_dir: Path | None = None,
+        db: Database | None = None,
+        alerter: Alerter | None = None,
     ) -> None:
         self._persona = config.persona
         self._llm = llm
         self._bank = bank
         self._runs = runs
         self._filter_log = filter_log
+        self._images = GeneratedImages(
+            images,
+            generated_dir,
+            image_style=config.image_style,
+            db=db,
+            alerter=alerter,
+        )
         self._tz = self._load_timezone(config.timezone)
         # A config typo in a validator name must abort the launch (plan
         # section 8), not surface as a broken 07:00 post.
@@ -312,11 +476,13 @@ class GenerativePipeline:
             return self._failed("safety checker rejected the post")
         if verdict is None:
             return self._failed("safety checker answer unreadable")
+        image_ref, image_alert = await self._slot_image(rubric, run, text)
         return GenerationOutcome(
             status="generated",
             text=text,
-            image_ref=rubric.image,
+            image_ref=image_ref,
             source_refs=self._seed_refs(seed),
+            alert=image_alert,
         )
 
     async def fallback_post(
@@ -353,12 +519,22 @@ class GenerativePipeline:
                 item.id,
                 exc,
             )
+        image_ref, image_alert = await self._slot_image(rubric, run, text)
         return GenerationOutcome(
             status="generated",
             text=text,
-            image_ref=rubric.image,
+            image_ref=image_ref,
             source_refs=self._seed_refs(item),
+            alert=image_alert,
         )
+
+    async def _slot_image(
+        self, rubric: RubricConfig, run, text: str
+    ) -> tuple[str | None, str | None]:
+        """A bank-type image ref passes through; ``generate`` generates."""
+        if rubric.image != GENERATE_IMAGE:
+            return rubric.image, None
+        return await self._images.slot_ref(rubric, run, text)
 
     # --- prompt inputs ------------------------------------------------------
 
