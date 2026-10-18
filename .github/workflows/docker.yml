@@ -230,4 +230,8 @@ jobs:
               exit 1
             fi
 
+            # VPS is single-purpose: drop images unused by running containers
+            # (old sha tags accumulate ~90 MB compressed per release).
+            docker image prune -a -f
+
             docker ps --filter "name=maxnewsbot" --format "table {{.Names}}\t{{.Image}}\t{{.Status}}"
