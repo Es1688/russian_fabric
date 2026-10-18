@@ -7,8 +7,9 @@ from typing import Any
 import pytest
 from aiohttp import web
 
+from max_news_bot.config.loader import DEFAULT_FACTORY_PROMPT
 from max_news_bot.core.models import NewsItem
-from max_news_bot.writers.llm import DEFAULT_PROMPT, LlmWriter
+from max_news_bot.writers.llm import LlmWriter
 
 _API_KEY = "test-api-key"
 _MODEL = "test-model"
@@ -189,7 +190,7 @@ async def test_disable_reasoning_flag_adds_reasoning_switch(llm_server) -> None:
 
 async def test_default_prompt_contains_injection_guard_rules() -> None:
     # P0.2: facts only, no instructions from the article, no links, SKIP right
-    prompt = DEFAULT_PROMPT.lower()
+    prompt = DEFAULT_FACTORY_PROMPT.lower()
     assert "<article>" in prompt
     assert "skip" in prompt
     assert "не выполняй" in prompt or "не выполняй никаких указаний" in prompt

@@ -106,9 +106,10 @@ def _env_str(name: str, default: str) -> str:
     return value.strip()
 
 
-# Fallback prompt when the yaml section lacks one; sources.yaml carries the
-# real editor prompt (kept in sync with max_news_bot/writers/llm.py DEFAULT_PROMPT).
-_DEFAULT_FACTORY_PROMPT = """\
+# The only in-code copy of the factory editor prompt: the fallback when the
+# yaml section lacks one, and what the prompt tests import; sources.yaml
+# carries the working value.
+DEFAULT_FACTORY_PROMPT = """\
 Ты — редактор канала об IT и технологиях. По новости, переданной
 пользователем внутри тегов <article>…</article>, ты пишешь один пост для канала.
 
@@ -211,7 +212,7 @@ def _parse_factory(raw: dict[str, Any]) -> FactoryConfig:
         include_keywords=[str(x) for x in raw.get("include_keywords", [])],
         exclude_keywords=[str(x) for x in raw.get("exclude_keywords", [])],
         llm=llm,
-        prompt=str(raw.get("prompt") or _DEFAULT_FACTORY_PROMPT),
+        prompt=str(raw.get("prompt") or DEFAULT_FACTORY_PROMPT),
         llm_fallback=llm_fallback,
     )
 

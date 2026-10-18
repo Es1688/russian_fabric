@@ -11,8 +11,9 @@ import os
 
 import pytest
 
+from max_news_bot.config.loader import DEFAULT_FACTORY_PROMPT
 from max_news_bot.core.models import NewsItem
-from max_news_bot.writers.llm import DEFAULT_PROMPT, LlmWriter
+from max_news_bot.writers.llm import LlmWriter
 from max_news_bot.writers.validator import validate_post_text
 
 pytestmark = pytest.mark.llm
@@ -45,7 +46,7 @@ async def test_real_llm_output_passes_validator() -> None:
         timeout=90,
         max_tokens=800,
         temperature=0.7,
-        prompt=DEFAULT_PROMPT,
+        prompt=DEFAULT_FACTORY_PROMPT,
     )
 
     result = await writer.write_post(_ITEM)

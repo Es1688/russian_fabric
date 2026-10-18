@@ -49,6 +49,17 @@ DEFAULT_FAL_MODEL = "fal-ai/flux/dev"
 DEFAULT_YANDEX_ART_SIZE = "1024x1024"
 DEFAULT_IMAGE_TIMEOUT_SECONDS = 120
 
+# Channel theme of the rubrics contour: the only in-code copy of the editor
+# persona (the working value lives in rubrics.yaml) and of the audience
+# phrase embedded in the contour's secondary system prompts.
+DEFAULT_PERSONA = (
+    "Ты — редактор канала для читателей старшего возраста в Санкт-Петербурге "
+    "и Ленинградской области. Говори уважительно и тепло, на «вы», простыми "
+    "словами: без сленга, англицизмов и иронии. Регион — контекст читателя: "
+    "северо-запад, короткий дачный сезон; не давай «южных» советов."
+)
+AUDIENCE = "читателей старшего возраста"
+
 _RUBRIC_ID_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 # NOTE: rubric times must be quoted in yaml: unquoted "12:30" parses as a
 # sexagesimal int (750) in YAML 1.1 and would fail validation.
