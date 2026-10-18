@@ -106,9 +106,9 @@ def _env_str(name: str, default: str) -> str:
     return value.strip()
 
 
-# The only in-code copy of the factory editor prompt: the fallback when the
-# yaml section lacks one, and what the prompt tests import; sources.yaml
-# carries the working value.
+# The single in-repo copy of the factory editor prompt: the value used when
+# the yaml section lacks a `prompt:` key (sources.yaml ships none) and what
+# the prompt tests import.
 DEFAULT_FACTORY_PROMPT = """\
 Ты — редактор канала об IT и технологиях. По новости, переданной
 пользователем внутри тегов <article>…</article>, ты пишешь один пост для канала.
