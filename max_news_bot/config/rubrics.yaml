@@ -1,15 +1,37 @@
-# Конфиг рубрик автономного канала — сетка из плана §2, схема из §8
-# (docs/plans/2026-10-09-autonomous-channel.md). Валидируется при старте:
-# опечатка в ключе или значении роняет запуск, а не пост в 07:00.
-#
-# Контур рубрик включается env-флагом RUBRICS_ENABLED=true (по умолчанию
-# false). Одновременно с legacy-циклами (FACTORY_ENABLED=true) он запрещён —
-# конфликт роняет запуск: активен ровно один контур публикации.
+# Конфиг единственного publishing-контура бота — сетки рубрик автономного
+# канала (схема из docs/plans/2026-10-09-autonomous-channel.md) и LLM-каналов
+# (перенесены сюда из удалённого sources.yaml: один контур — один файл).
+# Валидируется при старте: опечатка в ключе или значении роняет запуск,
+# а не пост в 07:00.
 #
 # Времена — местные, в timezone ниже (МСК). В yaml их нужно брать в кавычки:
 # незакавыченное 12:30 YAML 1.1 распарсит как число 750.
 
 timezone: "Europe/Moscow"
+
+# LLM-каналы (failover на каждый запрос: первичный, при любой его ошибке —
+# резервный). Ключи — только в .env: OPENROUTER_API_KEY (первичный,
+# OpenRouter) и LLM_API_KEY (резервный, Yandex AI Studio; он же обслуживает
+# YandexART). Резервный канал существует только при заданном LLM_API_KEY;
+# при включённых рубриках LLM-видов оба ключа обязательны.
+# timeout/max_tokens/temperature общие для обоих каналов, задаются в llm.
+# Переопределение endpoint/модели без правки файла: LLM_BASE_URL, LLM_MODEL,
+# LLM_FALLBACK_BASE_URL, LLM_FALLBACK_MODEL.
+llm:
+  base_url: "https://openrouter.ai/api/v1"
+  model: "qwen/qwen3.8-flash"
+  # Thinking-модель иначе тратит весь max_tokens на рассуждения и возвращает
+  # пустой content — reasoning отключается в payload запроса.
+  disable_reasoning: true
+  timeout: 60
+  max_tokens: 800
+  temperature: 0.7
+llm_fallback:
+  base_url: "https://ai.api.cloud.yandex.net/v1"
+  # Модель — полный URI gpt://<folder_id>/<model>. FOLDER_ID — заглушка:
+  # заменить на реальный id каталога Yandex Cloud.
+  model: "gpt://FOLDER_ID/yandexgpt-5-lite"
+  disable_reasoning: false
 
 persona: |
   Ты — редактор канала для читателей старшего возраста в Санкт-Петербурге

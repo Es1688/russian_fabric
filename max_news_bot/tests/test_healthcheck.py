@@ -1,19 +1,12 @@
 from __future__ import annotations
 
-import json
 import sqlite3
 from datetime import datetime, timedelta
 
 import pytest
 
 from max_news_bot.scripts import healthcheck
-from max_news_bot.scripts.healthcheck import (
-    _factory_healthy,
-    _parse_active_hours,
-    _within_window,
-    _window_hours,
-    _rubrics_healthy,
-)
+from max_news_bot.scripts.healthcheck import _rubrics_healthy
 
 
 @pytest.fixture
@@ -26,24 +19,6 @@ def conn(tmp_path):
             event TEXT NOT NULL,
             details TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE posts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            news_url TEXT UNIQUE NOT NULL,
-            source TEXT NOT NULL,
-            title TEXT NOT NULL,
-            text TEXT,
-            status TEXT NOT NULL,
-            attempts INTEGER NOT NULL DEFAULT 0,
-            error TEXT,
-            prompt_version TEXT,
-            llm_model TEXT,
-            tokens INTEGER,
-            message_id TEXT,
-            rejected_text TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            published_at TIMESTAMP,
-            last_attempt_at TIMESTAMP
         );
         CREATE TABLE slot_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,10 +46,9 @@ def conn(tmp_path):
 
 
 @pytest.fixture
-def env(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("FACTORY_INTERVAL_HOURS", "4")
-    monkeypatch.setenv("FACTORY_ACTIVE_HOURS", "08:00-23:00")
-    monkeypatch.delenv("FACTORY_ENABLED", raising=False)
+def rubrics_env(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("SLOT_HEARTBEAT_SECONDS", raising=False)
+    monkeypatch.delenv("SLOT_TZ", raising=False)
 
 
 def _fixed_clock(monkeypatch: pytest.MonkeyPatch, hour: int, minute: int) -> None:
@@ -100,109 +74,6 @@ def _log(conn, event: str, details: str, created_at: str | None = None) -> None:
     conn.commit()
 
 
-def _insert_post(conn, status: str, *, when: str = "datetime('now')") -> None:
-    conn.execute(
-        f"INSERT INTO posts (news_url, source, title, status, created_at, "
-        f"published_at, last_attempt_at) "
-        f"VALUES ('u{status}{conn.total_changes}', 's', 't', ?, {when}, {when}, {when})",
-        (status,),
-    )
-    conn.commit()
-
-
-# --- active hours parsing -----------------------------------------------------
-
-
-def test_parse_active_hours_variants() -> None:
-    assert _parse_active_hours("08:00-23:00") == (
-        datetime(2000, 1, 1, 8, 0).time(),
-        datetime(2000, 1, 1, 23, 0).time(),
-    )
-    assert _parse_active_hours(" 22:00 - 06:00 ") is not None
-    assert _parse_active_hours("") is None
-    assert _parse_active_hours(None) is None
-    assert _parse_active_hours("garbage") is None
-    assert _parse_active_hours("25:00-26:00") is None
-
-
-def test_window_hours_same_day_and_overnight() -> None:
-    same_day = _parse_active_hours("08:00-23:00")
-    overnight = _parse_active_hours("22:00-06:00")
-    assert _window_hours(same_day) == pytest.approx(15.0)
-    assert _window_hours(overnight) == pytest.approx(8.0)
-
-
-def test_within_window_overnight() -> None:
-    window = _parse_active_hours("22:00-06:00")
-    assert _within_window(datetime(2000, 1, 1, 23, 30).time(), window)
-    assert _within_window(datetime(2000, 1, 1, 3, 0).time(), window)
-    assert not _within_window(datetime(2000, 1, 1, 12, 0).time(), window)
-
-
-# --- factory rules --------------------------------------------------------------
-
-
-def test_no_events_is_grace_period(conn, env) -> None:
-    assert _factory_healthy(conn) is True
-
-
-def test_stale_heartbeat_is_unhealthy(conn, env) -> None:
-    _log(conn, "factory_run", json.dumps({"state": "run", "deduped": 0}), "datetime('now','-1 day')")
-    assert _factory_healthy(conn) is False
-
-
-def test_idle_heartbeat_counts_as_liveness(conn, env) -> None:
-    _log(conn, "factory_run", json.dumps({"state": "idle", "reason": "quiet_hours"}))
-    assert _factory_healthy(conn) is True
-
-
-def test_paused_factory_is_healthy_even_without_posts(conn, env, monkeypatch) -> None:
-    _fixed_clock(monkeypatch, 12, 0)
-    _log(conn, "factory_run", json.dumps({"state": "idle", "reason": "paused"}))
-    _insert_post(conn, "published", when="datetime('now','-3 days')")
-    assert _factory_healthy(conn) is True
-
-
-def test_stale_publication_inside_window_is_unhealthy(conn, env, monkeypatch) -> None:
-    _fixed_clock(monkeypatch, 12, 0)
-    _log(conn, "factory_run", json.dumps({"state": "run", "deduped": 0}))
-    _insert_post(conn, "published", when="datetime('now','-2 days')")
-    assert _factory_healthy(conn) is False
-
-
-def test_stale_publication_outside_window_is_healthy(conn, env, monkeypatch) -> None:
-    _fixed_clock(monkeypatch, 23, 30)  # after 23:00 the rule sleeps
-    _log(conn, "factory_run", json.dumps({"state": "run", "deduped": 0}))
-    _insert_post(conn, "published", when="datetime('now','-2 days')")
-    assert _factory_healthy(conn) is True
-
-
-def test_fresh_previewed_post_counts_as_publication(conn, env, monkeypatch) -> None:
-    _fixed_clock(monkeypatch, 12, 0)
-    _log(conn, "factory_run", json.dumps({"state": "run", "deduped": 0}))
-    _insert_post(conn, "previewed")
-    assert _factory_healthy(conn) is True
-
-
-def test_never_published_red_only_with_candidates(conn, env, monkeypatch) -> None:
-    _fixed_clock(monkeypatch, 12, 0)
-    _log(conn, "factory_run", json.dumps({"state": "run", "deduped": 0, "recovered": 0}))
-    assert _factory_healthy(conn) is True  # nothing to publish: not an incident
-
-    _log(conn, "factory_run", json.dumps({"state": "run", "deduped": 3, "recovered": 0}))
-    assert _factory_healthy(conn) is False  # candidates existed, no output
-
-
-# --- rubrics contour rules (RUBRICS_ENABLED=true, plan section 11) ---------------
-
-
-@pytest.fixture
-def rubrics_env(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("RUBRICS_ENABLED", "1")
-    monkeypatch.delenv("SLOT_HEARTBEAT_SECONDS", raising=False)
-    monkeypatch.delenv("SLOT_TZ", raising=False)
-
-
 def _today() -> str:
     return datetime.now().date().isoformat()
 
@@ -217,6 +88,9 @@ def _slot_run(conn, rubric: str, slot_date: str, status: str) -> None:
         (rubric, slot_date, status),
     )
     conn.commit()
+
+
+# --- watchdog rules (plan section 11; unconditional: the only contour) -----------
 
 
 def test_rubrics_missing_tables_is_first_boot_grace(tmp_path) -> None:
@@ -319,6 +193,16 @@ def test_rubrics_summary_check_sleeps_before_evening(
 
 def test_rubrics_never_sent_summary_is_grace(conn, rubrics_env, monkeypatch) -> None:
     _fixed_clock(monkeypatch, 23, 40)
+    _log(conn, "slot_heartbeat", "quiet")
+    _slot_run(conn, "good_morning", _today(), "published")
+    assert _rubrics_healthy(conn) is True
+
+
+def test_stale_digest_run_event_is_not_checked(conn, rubrics_env) -> None:
+    # the legacy digest/factory rules are gone: an old "run"/"factory_run"
+    # event in a production database must not fail the healthcheck
+    _log(conn, "run", "collected=1", "datetime('now','-30 days')")
+    _log(conn, "factory_run", "{}", "datetime('now','-30 days')")
     _log(conn, "slot_heartbeat", "quiet")
     _slot_run(conn, "good_morning", _today(), "published")
     assert _rubrics_healthy(conn) is True

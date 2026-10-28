@@ -106,8 +106,9 @@ def make_config(
     timezone: str = "UTC",
     daily_cap: int = 6,
 ) -> RubricsConfig:
+    from max_news_bot.tests.conftest import make_llm_channels
+
     return RubricsConfig(
-        enabled=True,
         timezone=timezone,
         persona="",
         image_style="",
@@ -115,6 +116,7 @@ def make_config(
         daily_cap=daily_cap,
         weather_points=(),
         rubrics=tuple(rubrics),
+        llm=make_llm_channels(),
     )
 
 
@@ -129,9 +131,8 @@ def failed_outcome(
 class FakePipeline:
     """RubricPipeline double: scripted outcomes, every call recorded.
 
-    ``outcomes`` plays back in order and the last one repeats, like
-    MockWriter in tests/mocks.py. Without outcomes every attempt succeeds
-    with GENERATED_TEXT.
+    ``outcomes`` plays back in order and the last one repeats. Without
+    outcomes every attempt succeeds with GENERATED_TEXT.
     """
 
     def __init__(

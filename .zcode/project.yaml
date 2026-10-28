@@ -1,0 +1,9 @@
+name: content-fabric-max
+
+quality:
+  test: uv run pytest
+
+constraints:
+  - MVP работает только на RSS-источниках; парсинг HTML — только через ADR
+  - Секреты (MAX_BOT_TOKEN, LLM_API_KEY, OPENROUTER_API_KEY, FAL_KEY) — только в .env
+  - Деплой и push — только с явного разрешения пользователя

@@ -1,15 +1,14 @@
 # Architecture — Content Fabric MAX News Bot
 
-Небольшой production-бот для сбора новостей из RSS-источников и публикации в канал мессенджера MAX.
-Проект — порт Telegram-бота content_fabric на российский стек доставки: мессенджер MAX (platform-api2.max.ru)
-и OpenAI-совместимые LLM-провайдеры для постов — OpenRouter первичным каналом,
-Yandex AI Studio резервным (ADR-002). Проект должен оставаться простым: сначала автономный MAX-бот,
-затем аккуратное встраивание в систему фабрики контента.
+Небольшой production-бот мессенджера MAX: ведёт автономный канал рубрик для аудитории
+старшего возраста СПб и Ленобласти. Проект — порт Telegram-бота content_fabric на российский
+стек доставки: мессенджер MAX (platform-api2.max.ru) и OpenAI-совместимые LLM-провайдеры —
+OpenRouter первичным каналом, Yandex AI Studio резервным (ADR-002).
 
-Главный принцип: отделить сбор и подготовку новости от способа публикации. Сегодня выходом является MAX,
-раньше был Telegram — ядро (RSS-сбор, фильтры, дедупликация, фабрика) при порте не поменялось.
-
-Контент-фабрика реализована внутри этого же бота — как второй параллельный цикл; см. раздел «Контент-фабрика».
+Единственный publishing-контур — слотовый планировщик рубрик (`bot/slot_scheduler.py`,
+конфиг `config/rubrics.yaml`); legacy-циклы (линк-дайджест и контент-фабрика IT-новостей)
+удалены (ADR-004). Главный принцип порта сохранён: платформенная специфика MAX сосредоточена
+в `max_api` и `publishers`, всё остальное платформенно-независимо.
 
 ---
 
@@ -240,6 +239,55 @@ visual-studio на aiohttp), а YandexART зарезервировать заг�
 
 ---
 
+## ADR-004: Единственный контур — рубрики; фабрика и дайджест удалены
+
+### Контекст и причины
+
+Исторически в процессе жили два взаимоисключающих контура: legacy (линк-дайджест
+`Pipeline` + контент-фабрика `ContentFactory`, IT-источники Habr/vc.ru) и контур
+рубрик, переключаемые `RUBRICS_ENABLED`/`FACTORY_ENABLED` с fail-fast на конфликт.
+Канал окончательно определился как канал одной тематики (контент для читателей
+старшего возраста), IT-направление из RSS больше не нужно. Дублирование механики
+(два планировщика, `FallbackWriter`/`FallbackCompletion`, два издателя, LLM-конфиг
+в секции `factory` файла `sources.yaml`, который читал и контур рубрик) стало
+чистой сложностью.
+
+### Решения
+
+1. `SlotScheduler` — единственный publishing-контур: `main.py` всегда стартует
+   `slot_scheduler_loop` + `daily_summary_loop` + `daily_backup_loop` + polling.
+2. Переключатели `RUBRICS_ENABLED`/`FACTORY_ENABLED` и валидация конфликта удалены;
+   `rubrics.yaml` обязателен и должен содержать хотя бы одну включённую рубрику.
+3. LLM-каналы переехали в `rubrics.yaml` (`llm:`/`llm_fallback:`) — один контур,
+   один конфиг-файл; `sources.yaml` удалён целиком. LLM-стек один:
+   `LlmCompletionClient` + `FallbackCompletion` (транспортные хелперы и
+   `SKIP_MARKER` переехали в `writers/completion.py` из удалённого `writers/llm.py`).
+4. Удалены: `core/factory.py`, `core/pipeline.py`, `bot/scheduler.py`,
+   `publishers/post.py`, `publishers/max.py`, `publishers/base.py`, `writers/llm.py`,
+   `writers/base.py` (`Writer`/`WriteResult`), `FallbackWriter`, `utils/filters.py`,
+   HTML-парсеры `parsers/habr.py`/`parsers/vc_ru.py` (RSS-only, см. решение MVP),
+   модель `Post` и методы БД по `posts`/`sent_news`.
+5. Команды: остались `/start /chatid /status /stats /factory
+   run|pause|resume|status|retract slot`; удалены `/sources`, `/news`, `/posts` и
+   `/factory retract <post_id>`; `/stats` читает публикации из `slot_runs`.
+6. `scripts/healthcheck.py` проверяет только слоты (heartbeat `slot_heartbeat`,
+   «тихий день», вечерняя сводка); digest/factory-правила и их env-гейты удалены —
+   иначе после деплоя контейнер краснел бы по старым `run`-событиям.
+7. Таблицы `posts`, `sent_news`, `sources_state` в рабочей БД не мигрируются и не
+   удаляются: код их больше не пишет, схема создаётся как раньше, чтобы прод-БД
+   поднималась без пересборки.
+
+### Последствия
+
+- Механика надёжности фабрики не потерялась — её закрывает слотовая машина
+  состояний (recovery `generated`-строк без повторного LLM, пауза рубрики после
+  N неудач, глобальная пауза MAX API, circuit-брейкеры источников).
+- История ADR-001–003 сохраняет силу, кроме упоминаний wiring'а фабрики
+  (`FallbackWriter` в `main.py`), которое заменил `FallbackCompletion`
+  в `bot/rubrics_runtime.py`.
+
+---
+
 ## Цели
 
 - Собрать MVP, который можно запустить в Docker и оставить работать без ручного присмотра.
@@ -293,38 +341,25 @@ visual-studio на aiohttp), а YandexART зарезервировать заг�
 
 | Команда | Назначение |
 |---|---|
-| `/status` | краткое состояние бота: uptime, последний запуск, ошибки |
-| `/sources` | список RSS-источников и их статус |
-| `/stats` | статистика публикаций за последние дни |
-| `/news` | ручной запуск сбора и публикации, только для админа |
+| `/status` | краткое состояние бота: uptime, heartbeat планировщика, ошибки |
+| `/stats` | статистика публикаций за последние дни (по `slot_runs`) |
 | `/chatid` | chat_id текущего чата/канала (для `MAX_CHANNEL_ID`) и user_id отправителя (для `ADMIN_IDS`) |
+| `/factory run|pause|resume|status|retract slot` | рычаги рубрик (аргумент — рубрика или `all`), только для админа |
 
-Изменение источников через команды можно добавить позже. Для начала источники правятся в `sources.yaml`, так проще и безопаснее.
+Ленты рубрики «Хорошие новости» правятся в `news_sources.yaml`, сетка — в `rubrics.yaml`.
 
-### 4. Контент-фабрика (реализовано; иначе, чем в эскизе)
+### 4. Контент-фабрика — удалена (ADR-004)
 
-Изначально здесь был эскиз: `ContentFactoryPublisher` передаёт `NewsItem` во внутренний
-API, webhook или очередь внешней фабрики, ядро сбора новостей не меняется.
-Реализовано иначе — прямым параллельным циклом `ContentFactory` в том же процессе:
-
-- `MaxPublisher` продолжает отправлять новости в канал (дайджест-цикл);
-- фабрика — второй цикл «поиск → LLM-написание поста → автопубликация» со своим
-  интервалом, своей дедупликацией и своими лимитами, публикует в тот же канал;
-- переиспользуются общие строительные блоки: `Fetcher` (RSS-сбор), `NewsItem`
-  и одна `aiohttp.ClientSession` на процесс.
-
-Почему не ветка `Publisher`: фабрика — не «другой транспорт для новости», а другой
-продукт (свой отбор, машина состояний posts, LLM-писатель с валидацией и лимитами);
-её требования не влезают в `Publisher.publish(items)` без раздувания контракта
-дайджеста. Подробности — в разделе «Контент-фабрика».
+Эскиз «`ContentFactoryPublisher` во внешнюю фабрику» не понадобился, реализованный
+параллельный цикл `ContentFactory` (LLM-посты из IT-новостей) удалён вместе с
+дайджест-циклом: канал определён как канал одной тематики, и его ведёт единственный
+слотовый планировщик рубрик. История решений — в ADR-004.
 
 ### 5. HTML и preview
 
-HTML-парсинг и preview-обогащение добавляются только после стабильного RSS-пайплайна:
-
-- `HtmlFetcher` для сайтов без RSS;
-- извлечение `og:title`, `og:description`, `og:image`;
-- дополнительные лимиты и таймауты, чтобы preview не тормозил публикацию.
+Отвергнуто окончательно: MVP работает только на RSS (архитектурное решение),
+HTML-парсеры Habr/vc.ru удалены вместе с их источниками (ADR-004). Возврат — только
+через новый ADR.
 
 ### 6. Webhook
 
@@ -337,34 +372,22 @@ https-домен с TLS от доверенного CA и ACK обновлени
 ## Архитектура MVP
 
 ```
-RSS-источники
+rubrics.yaml (сетка + LLM-каналы)          news_sources.yaml («мягкие» RSS)
+      |                                            |
+      v                                            v
+SlotScheduler (тик 45 c) -------- digest-рубрика: CompositeFetcher (RSS-only)
+      | захват UNIQUE(rubric_id, slot_date)        |
+      v                                            v
+пайплайн рубрики (bank / generative / weather / digest + LLM + валидаторы)
       |
       v
-RssFetcher
-      |
-      v
-NewsItem[]
-      |
-      v
-KeywordFilter
-      |
-      v
-Deduplicator / SQLite
-      |
-      v
-PostFormatter
-      |
-      v
-Publisher
-      |
-      +--> MaxPublisher  ->  MaxClient (max_api)  ->  MAX Bot API
+MaxSlotPublisher -> MaxClient (max_api) -> MAX Bot API (канал / превью админам)
 ```
 
-Ключевая идея: `Publisher` является границей между ядром бота и внешней системой публикации.
+Ключевая идея прежняя: издатель — граница между ядром и внешней системой.
 `max_api.MaxClient` — тонкий REST-клиент (aiohttp), единственное место, знающее
-специфику MAX Bot API (заголовок Authorization без Bearer, REST-ресурсы, `mid`).
-
-Это поток дайджест-цикла. Контент-фабрика — второй, параллельный цикл (см. «Контент-фабрика»).
+специфику MAX Bot API (заголовок Authorization без Bearer, REST-ресурсы, `mid`,
+двухшаговый `POST /uploads` для картинок).
 
 ---
 
@@ -384,50 +407,55 @@ Publisher
     │
     ├── bot/
     │   ├── polling.py        # long polling GET /updates, диспетчер обновлений
-    │   ├── handlers.py       # команды бота (дайджест + фабрика)
-    │   └── scheduler.py      # два шедулер-цикла: дайджест и фабрика
+    │   ├── handlers.py       # команды бота (рубрики)
+    │   ├── slot_scheduler.py # слотовый планировщик — единственный контур
+    │   ├── rubrics_admin.py  # /factory run|pause|resume|status|retract slot
+    │   ├── rubrics_runtime.py# сборка контура (пайплайны, LLM, картинки, сводка)
+    │   ├── daily_summary.py  # ежедневная сводка админам
+    │   └── db_backup.py      # ежедневный бэкап SQLite
     │
     ├── config/
-    │   ├── loader.py         # YAML + .env (settings, filters, factory)
-    │   └── sources.yaml      # RSS-источники и настройки
+    │   ├── loader.py         # env процесса + load_rubrics_config
+    │   ├── rubrics.py        # валидация rubrics.yaml (+ llm/llm_fallback)
+    │   ├── rubrics.yaml      # сетка рубрик и LLM-каналы — конфиг контура
+    │   └── news_sources.yaml # «мягкие» RSS для рубрики «Хорошие новости»
     │
     ├── core/
-    │   ├── models.py         # NewsItem, Post, PublishedResult
-    │   ├── pipeline.py       # дайджест: fetch -> filter -> dedupe -> publish
-    │   ├── factory.py        # цикл контент-фабрики (без max_api)
+    │   ├── models.py         # NewsItem, SlotRun, ContentBankItem, ...
     │   └── __init__.py
     │
     ├── parsers/
-    │   ├── base.py           # интерфейс fetcher
+    │   ├── base.py           # SourceConfig + интерфейс Fetcher
     │   ├── rss.py            # RSS/Atom fetcher (+ summary, общая сессия)
-    │   ├── habr.py           # источник Habr
-    │   ├── vc_ru.py          # источник vc.ru
-    │   ├── composite.py      # составной fetcher по списку источников
-    │   └── __init__.py
+    │   └── composite.py      # RSS-only составной fetcher digest-рубрики
     │
     ├── publishers/
-    │   ├── base.py           # интерфейс Publisher (дайджест)
-    │   ├── max.py            # публикация в канал MAX (дайджест)
-    │   ├── post.py           # PostPublisherProtocol + PostPublisher (фабрика)
+    │   ├── slot.py           # MaxSlotPublisher (канал / превью, картинки)
     │   ├── alerter.py        # Alerter + MaxAlerter (алерты админам)
     │   └── __init__.py
     │
     ├── writers/
-    │   ├── base.py           # Writer-протокол + WriteResult
-    │   ├── llm.py            # LlmWriter (OpenAI-совместимый API: OpenRouter / Yandex)
-    │   ├── validator.py      # валидация вывода LLM (лимит 4000)
-    │   └── __init__.py
+    │   ├── completion.py     # LlmCompletionClient + FallbackCompletion-транспорт, SKIP_MARKER
+    │   ├── fallback.py       # FallbackCompletion (per-request failover)
+    │   ├── readiness.py      # стартовая проба обоих LLM-каналов
+    │   └── validator.py      # валидация вывода LLM (лимит 4000)
+    │
+    ├── rubrics/              # пайплайны рубрик (generative, digest, news_filters)
+    ├── bank/                 # банк контента (отбор, антиповтор, валидатор)
+    ├── weather/              # Open-Meteo + met.no, шаблон, валидатор
+    ├── images/               # fal.ai (flux/dev) + фолбэк-обёртка
     │
     ├── utils/
-    │   ├── db.py             # SQLite, миграции user_version, дедуп, статистика
+    │   ├── db.py             # SQLite, миграции user_version, события
+    │   ├── repositories.py   # репозитории slot_runs, content_bank, ...
     │   ├── text.py           # canonical_url, title_tokens, jaccard
     │   ├── sanitize.py       # санитайзер HTML-разметки сообщения
-    │   ├── filters.py        # keyword-фильтрация
     │   ├── formatter.py      # текст поста (лимит 4000)
     │   └── logging.py        # настройка логирования
     │
     ├── scripts/
-    │   └── healthcheck.py    # Docker healthcheck (дайджест + фабрика; DATABASE_PATH из env)
+    │   ├── healthcheck.py    # Docker healthcheck (слоты; DATABASE_PATH из env)
+    │   └── bank_import.py    # импорт банка контента из seed-yaml
     │
     ├── data/
     │   └── max_news_bot.db   # Docker volume
@@ -463,338 +491,65 @@ class NewsItem:
     summary: str | None = None
 ```
 
-`summary` — очищенный от HTML текст RSS-описания (обрезка ~1000 символов): фабрика
-отдаёт его LLM как исходный материал.
+`summary` — очищенный от HTML текст RSS-описания (обрезка ~1000 символов): digest-рубрика
+отдаёт его LLM-классификатору как исходный материал.
 
-Для фабрики добавлена модель `Post` — состояние поста в таблице `posts`
-(см. «Машина состояний posts» в разделе «Контент-фабрика»).
+Состояние публикации живёт в `SlotRun` (см. слотовую машину состояний в
+`bot/slot_scheduler.py` и плане автономного канала).
 
-Для MVP достаточно `dataclass`. `pydantic` можно добавить позже, если появится внешний API или строгая валидация payload для фабрики.
+Для MVP достаточно `dataclass`. `pydantic` можно добавить позже, если появится внешний API.
 
 ---
 
 ## Publisher
 
-Публикация должна быть отдельным интерфейсом, а не частью парсера или scheduler.
-
-```python
-from typing import Protocol
-
-
-class Publisher(Protocol):
-    async def publish(self, items: list[NewsItem]) -> PublishedResult:
-        ...
-```
-
-На первом этапе реализуется только `MaxPublisher` (через `max_api.MaxClient`).
-Эскизная идея `ContentFactoryPublisher` не понадобилась: фабрика контента реализована
-параллельным циклом (см. «Контент-фабрика»), а `Publisher` остаётся контрактом дайджест-пайплайна.
-
-Это не усложняет MVP, но защищает проект от переписывания, когда бот станет частью фабрики контента.
+Публикация — отдельный интерфейс, а не часть пайплайна: `SlotPublisher`
+(протокол в `bot/slot_scheduler.py`), реализация `MaxSlotPublisher` в
+`publishers/slot.py` — текст + опциональная картинка, канал или превью админам
+(dry-run), двухшаговая загрузка изображений через `POST /uploads`.
+Переиспользование интерфейса защищает пайплайны от платформенной специфики MAX.
 
 ---
 
-## Поток одного цикла дайджеста
+## Жизненный цикл слота (кратко)
+
+Подробная машина состояний, recovery и выключатели описаны в плане автономного
+канала (docs/plans/2026-10-09-autonomous-channel.md, §10–11) и реализованы в
+`bot/slot_scheduler.py`:
 
 ```
-scheduler.py или /news
+slot_scheduler_loop (тик 45 c)
   |
   v
-Pipeline.run()
+захват слота: INSERT pending за UNIQUE(rubric_id, slot_date)
   |
-  +--> загрузить enabled RSS-источники
-  +--> RssFetcher.fetch(source)
-  +--> привести записи к NewsItem
-  +--> KeywordFilter.passes(item)
-  +--> db.is_sent(item.url)
-  +--> Publisher.publish(items)
-  +--> db.mark_sent(item.url)
-  +--> db.log_event(...)
+  v
+пайплайн рубрики (генерация + валидаторы, до 3 попыток; резервный пост из банка)
+  |
+  v
+MaxSlotPublisher: publishing -> published (+ skipped / failed / unknown_delivery)
 ```
 
-Важное правило: помечать новость как отправленную только после успешной публикации. Иначе можно потерять новость при ошибке MAX API.
-
-Для защиты от двойного запуска используется один lock:
-
-```python
-publish_lock = asyncio.Lock()
-
-async with publish_lock:
-    await pipeline.run()
-```
-
-У фабрики — свой отдельный `asyncio.Lock` с тем же назначением: циклы не блокируют
-друг друга. Общие при этом ресурсы (MAX-лимиты, одна SQLite) — см. «Раздельные
-локи, общие ресурсы» в разделе «Контент-фабрика».
-
----
-
-## Контент-фабрика
-
-Фабрика — второй независимый цикл бота: «поиск информации → написание поста (LLM) →
-автопубликация в тот же MAX-канал». Дайджест-пайплайн при этом не меняется:
-у фабрики свой интервал, свой `asyncio.Lock`, свой отбор (ключевые слова и возраст
-новостей), своя дедупликация и свои лимиты. Оба цикла живут в одном процессе,
-публикуют в один канал одним ботом и пишут в одну SQLite-базу.
-
-Автопубликация включается только после раскатки через dry-run с числовыми
-критериями выхода (сценарий — в README).
-
-### Стадии цикла
-
-```
-factory_scheduler_loop (свой интервал, свой asyncio.Lock)
-  |
-  v
-проверка паузы и тихих часов --- вне окна / пауза ---> heartbeat-событие idle
-  |                                                     (factory_run, JSON)
-  v
-recovery: draft старше stale_draft_minutes публикуется повторно
-  |        (текст уже в БД, LLM не вызывается; входит в оба лимита)
-  v
-RSS-источники (те же, что у дайджеста) -> RssFetcher (общая ClientSession)
-  |
-  v
-фильтр ключей фабрики (factory.include/exclude_keywords)
-  |
-  v
-age-фильтр: max_news_age_hours по published_at (новость без даты — мимо отбора)
-  |
-  v
-канонизация URL: срезать utm_*/fbclid и фрагмент, убрать trailing slash,
-  |             хост в нижнем регистре
-  v
-дедупликация:
-  +-- posts: статус draft | published | previewed | skipped,
-  |           либо failed с attempts >= max_attempts
-  +-- Jaccard заголовков >= ~0.7: посты за 7 дней + внутри пачки цикла
-  |
-  v
-лимиты: posts_per_cycle и max_posts_per_day (по last_attempt_at)
-  |
-  v
-LlmWriter: новость в разделителях <article>...</article>,
-  |         анти-инъекция, запрет выводить ссылки, право вернуть SKIP
-  v
-валидатор: без URL; видимая длина ~200..max_post_chars (жёсткий предел 4000 —
-  |         лимит MAX); без отказ-фраз ("As an AI...")
-  v
-санитайзер: whitelist <b> <i> <a href>, остальное через html.escape;
-  |          href только http/https; несбалансированные теги -> fallback
-  v
-PostPublisher: HTTP 429 MAX (спать и повторить, до 2–3 раз),
-  |            пауза ~2-3 с между постами (лимит 2 msg/sec на диалог);
-  |            ссылку на источник добавляет код;
-  |            dry-run -> админам, mid не сохраняется
-  v
-mark_post_published(mid) / mark_post_failed(error) / skipped (терминальный)
-```
-
-### Границы архитектуры
-
-`core/factory.py` не импортирует `max_api` — как и `core/pipeline.py` (проверяется
-тестом архитектуры). Вся MAX-специфика спрятана за протоколами:
-
-```python
-# writers/base.py
-@dataclass(frozen=True)
-class WriteResult:
-    status: str              # "written" | "skipped" | "error"
-    post: Post | None
-    error_kind: str | None   # "content" | "infra" | "config"
-    error: str | None        # обрезан ~300, без заголовков и ключей
-    tokens: int = 0
-    latency_ms: int = 0
-
-
-class Writer(Protocol):
-    async def write_post(self, item: NewsItem) -> WriteResult: ...
-
-
-# publishers/post.py
-class PostPublisherProtocol(Protocol):
-    async def publish_post(self, post: Post, *, to_admins: bool = False) -> PostPublishResult: ...
-
-
-# publishers/alerter.py
-class Alerter(Protocol):
-    async def send_alert(self, text: str) -> None: ...
-    async def send_recovery(self, text: str) -> None: ...
-```
-
-- `WriteResult` явно различает успех, SKIP (материал нерелевантен или скуден) и
-  ошибку с её классом, и несёт usage (токены, латентность) для счётчиков.
-- `LlmWriter` ходит в OpenAI-совместимый API любого провайдера (`base_url` +
-  `model`) на уже имеющемся aiohttp — новых pip-зависимостей нет; дефолт —
-  OpenRouter (`qwen/qwen3.8-flash`), Yandex AI Studio — резервный канал (ADR-002).
-- Один общий `aiohttp.ClientSession` на процесс передаётся в `RssFetcher`,
-  `LlmWriter` и `MaxClient` и закрывается при shutdown.
-
-### Машина состояний posts
-
-Таблица `posts` (миграция v2): `news_url` UNIQUE (канонический URL), `status`,
-`text` (nullable), `attempts`, `error`, `prompt_version`, `llm_model`, `tokens`,
-идентификатор отправленного сообщения (в MAX — `mid`), `rejected_text`,
-`created_at`, `published_at`, `last_attempt_at`.
-
-| Статус | Что значит | Переходы |
-|---|---|---|
-| `draft` | текст сгенерирован, отправка ещё не подтверждена | → `published` / `previewed` / `failed` |
-| `published` | отправлен в канал, сохранён `mid` | терминальный |
-| `previewed` | dry-run: отправлен админам, `mid` NULL | терминальный; для healthcheck/алертов — успех |
-| `failed` | зафиксирована ошибка обработки | рерайт в следующих циклах, пока `attempts < max_attempts` |
-| `skipped` | LLM вернул маркер SKIP (материал нерелевантен/скуден) | терминальный, не ретраится |
-
-Правила:
-
-- Строка posts создаётся при любой **обработанной** ошибке (LLM, валидация,
-  отправка) — чтобы вёлся счётчик attempts; колонка `text` nullable, у строк
-  ошибок текста может не быть. При `CancelledError` строка не создаётся: отмена
-  таска — не попытка, «зависший» draft ловит recovery.
-- `attempts` инкрементируют только контентные ошибки; после `max_attempts` (3)
-  пост остаётся `failed` и в отбор больше не попадает.
-- `last_attempt_at` обновляется при каждой попытке, включая UPSERT-ретраи: по
-  нему считается `max_posts_per_day` (`count_attempts_today`), потому что ретраи
-  тоже расходуют LLM-вызовы.
-- `rejected_text` — отклонённый валидатором вывод (обрезка ~2000): без него
-  критерий раскатки «0 ложных срабатываний валидатора» непроверяем — не видно,
-  что именно отклонено.
-- `prompt_version` = sha1(prompt)[:8] считается автоматически — ручное
-  обновление версии промпта забудется.
-
-### Три класса ошибок
-
-| Класс | Примеры | attempts | Реакция |
-|---|---|---|---|
-| Контентные | провал валидатора, форматирование | +1, до `max_attempts` = 3 | рерайт в следующем цикле |
-| Инфраструктурные | таймаут, сеть, HTTP 429/5xx, сбои сети MAX | не растут | circuit breaker: после 2–3 подряд цикл прерывается (экономия токенов), новости ретраятся в следующем цикле без штрафа |
-| Конфиг/доступ | HTTP 401/402/403/404 — протух ключ, кончился баланс Yandex, неверное имя модели | не растут | немедленная авто-пауза (флаг `factory_autopause` в `sources_state`) + немедленный алерт админу; снимается `/factory resume` |
-
-Конфиг/доступ выделен в отдельный класс, потому что ретраи здесь бессмысленны:
-без этого за три цикла сбоя провайдера все новости окна ушли бы навсегда в
-`failed`. Тексты ошибок в posts и событиях — без заголовков запросов и ключей,
-обрезка ~300 символов.
-
-### Recovery и at-least-once
-
-В начале каждого цикла draft старше `stale_draft_minutes` публикуется повторно:
-текст уже в БД, LLM не вызывается. Recovery уважает текущий dry_run, паузу и
-тихие часы и занимает место в `posts_per_cycle` и `max_posts_per_day`.
-
-Семантика доставки — **at-least-once**, и это осознанный компромисс: падение
-процесса между успешной отправкой в MAX и `mark_post_published` даст дубль
-поста при восстановлении. Цена exactly-once (координация транзакций между
-MAX API и SQLite) для соло-проекта не оправдана, а окно между send и mark
-исчезающе мало. Дубли при краше редки и убираются `/factory retract`.
-
-### Дедупликация фабрики
-
-Кандидат отбрасывается, если:
-
-- есть строка posts со статусом `draft | published | previewed | skipped`;
-- или `failed` с `attempts >= max_attempts` (контентные ошибки);
-- или Jaccard заголовков ≥ ~0.7 против постов за 7 дней или внутри пачки
-  текущего цикла (нормализованные токены заголовков, stdlib — без новых
-  зависимостей).
-
-`sent_news` фабрика не читает и не пишет: дайджест и фабрика — независимые
-потребители одних RSS-источников. Дубль в канале (ссылка в дайджесте + пост
-фабрики по той же новости) принят осознанно: пост — переработка, а не повтор
-ссылки; дайджест — «быстрая полоса», его код не трогаем.
-
-`failed` с запасом попыток рерайтится в следующем цикле: UPSERT по каноническому
-`news_url`, attempts растёт только за контентное.
-
-### Политика «ссылку на источник добавляет код»
-
-Промпт запрещает LLM выводить любые ссылки; валидатор отклоняет вывод, содержащий
-URL или `<a href>`; ссылку на источник (`news_url`) код добавляет к сообщению при
-отправке. Почему так:
-
-- инъекция через ссылку невозможна: LLM не контролирует ни один URL в итоговом
-  сообщении, проверка доменов не нужна;
-- редиректы и агрегаторы не ломают валидацию: ссылка ведёт на исходный URL как
-  есть, каким бы «некрасивым» он ни был.
-
-Защита от prompt injection в тексте: данные новости оборачиваются в разделители
-`<article>…</article>`; system-prompt явно требует использовать только факты из
-статьи и не выполнять инструкции из её текста.
-
-Пометка «подготовлено с помощью ИИ» решением владельца не добавляется (юрисдикция
-РФ, требования ЕС неприменимы). Если понадобится — одна опция конфига в месте,
-где код добавляет ссылку на источник.
-
-### Раздельные локи, общие ресурсы
-
-У дайджеста и фабрики — разные `asyncio.Lock`: циклы независимы и не должны
-блокировать друг друга. Но ресурсы у них общие:
-
-- **MAX-лимиты**: оба цикла публикуют в один канал одним ботом; лимит —
-  2 сообщения в секунду на диалог (30 rps глобально). `PostPublisher`
-  обрабатывает `MaxRateLimitError` (HTTP 429: спать и повторить, до 2–3 раз)
-  и выдерживает паузу ~2–3 с между постами.
-- **Одна SQLite**: включён WAL, `busy_timeout` выставляется на каждом соединении
-  (`timeout=` в `sqlite3.connect`); каталог `data/` монтируется в Docker целиком,
-  а не отдельным файлом — WAL-файлы живут на volume (проверено по
-  `infra/compose.prod.yml` и VPS-варианту `data:/app/data`).
-
-Короткие транзакции плюс WAL делают одновременную запись двух циклов безопасной.
-
-### Управление
-
-Единое правило включённости:
-
-```
-enabled = (env FACTORY_ENABLED, если задан, иначе yaml factory.enabled)
-          AND не paused (ручная пауза, /factory pause)
-          AND не auto-paused (сбой конфига/доступа; снимается /factory resume)
-```
-
-- `factory.dry_run`: пост генерируется и отправляется админам в личку вместо
-  канала; статус `previewed` терминальный — после выключения dry-run пост
-  автоматически в канал не уйдёт. Для healthcheck и алертов `previewed`
-  считается успехом. Важно: админ должен был один раз написать боту `/start`
-  (см. ADR-001), иначе личное сообщение не доставляется.
-- `/factory pause | resume`: флаг в БД (`sources_state`, name='factory') —
-  остановка цикла без редеплоя; `resume` снимает и ручную, и авто-паузу.
-- `/factory run` — ручной запуск цикла; `/factory status` — состояние и причина
-  остановки (paused / autopause с кодом ошибки).
-- `/factory retract <id>` — удаляет сообщение из канала по `mid`
-  (через MAX API), только админ. Страховочный механизм вместо постоянной
-  модерации.
-- `/posts` — последние посты со статусами, попытками и обрезанными ошибками.
-- Все команды фабрики админские (`ADMIN_IDS`).
-- `enabled=true` без `OPENROUTER_API_KEY` / `LLM_API_KEY` — ошибка старта
-  (ValueError): при активном LLM-контуре обязательны оба ключа (ADR-002);
-  секреты живут только в `.env`.
-
-### Тихие часы и heartbeat
-
-`factory.active_hours` («08:00–23:00») в таймзоне из `factory.timezone` (zoneinfo,
-stdlib). Вне окна и на паузе цикл пишет heartbeat-событие `factory_run` с JSON
-`{"state": "idle", "reason": "quiet_hours" | "paused"}` — healthcheck не краснеет
-ночью и на паузе.
+После рестарта: `pending` внутри grace доисполняется, `generated` публикует
+сохранённый текст без повторного LLM-вызова, `publishing` повторно вслепую не
+отправляется — становится `unknown_delivery` с алертом админу. N неудач подряд
+пауза рубрику (`/factory resume` снимает), сбой MAX API — глобальная пауза с
+переотправкой, пустой источник исключается после трёх пустых ответов.
 
 ### Наблюдаемость и healthcheck
 
-- `factory_run` (рабочие циклы) пишет в `details` JSON-счётчики стадий
-  `collected/filtered/deduped/written/skipped/published|previewed/failed`,
-  латентность LLM и токены. В отличие от текстовых деталей дайджеста, JSON
-  машиночитаем: по нему работают healthcheck, счётчик неудачных циклов и дедуп
-  алертов.
-- «Неудачный цикл» = `written == 0 and failed > 0`. Цикл, где всё получило SKIP, —
-  не авария. После `alert_after_failed_cycles` (3) подряд — **одно** сообщение
-  админам на инцидент (факт отправки фиксируется событием `factory_alert`, без
-  спама каждый цикл) и одно сообщение при восстановлении.
-- Конфиг/доступ — немедленный алерт и авто-пауза, вне счётчика N циклов.
-- Healthcheck фабрики: «нет публикаций (или previewed в dry-run) дольше X часов
-  при наличии кандидатов» → unhealthy; heartbeat — признак живого цикла. Правило
-  «нет публикаций» проверяется **только внутри активного окна**, а X вычисляется
-  как длина окна + один интервал цикла (не задаётся вручную) — иначе ночное окно
-  (9 ч в примере) покраснело бы к 07:00 при последнем посте в 22:30, хотя
-  heartbeat подтверждает живой цикл.
-- Healthcheck не ходит в MAX API: скрипт `scripts/healthcheck.py` читает только
-  SQLite (`DATABASE_PATH` из окружения) — нет зависимости от мессенджера.
+- Планировщик пишет в `bot_stats` событие `slot_heartbeat` каждые 900 с даже в
+  тихий день — внешний watchdog отличает «слотов нет» от «процесс завис».
+- LLM-обёртка `FallbackCompletion` пишет по событию на вызов
+  (`llm_primary_ok` / `llm_fallback_used` / `llm_fallback_error_<kind>`);
+  конфиг-ошибка любого канала немедленно алертит админов (дедуп — раз в сутки
+  на канал), даже когда успешный резерв маскирует сбой.
+- Healthcheck (Docker, `scripts/healthcheck.py`, только SQLite без сети):
+  свежесть `slot_heartbeat` (окно 2×900 с); «тихий день» — после 09:00 местный
+  день должен содержать хотя бы один терминальный `slot_runs`; вечерняя сводка —
+  после 23:30 последнее событие `daily_summary` должно покрывать сегодняшний день.
+  Правила digest/factory удалены вместе с контуром (ADR-004).
+- Пустая БД без `slot_runs` — льготный период первого бута, не unhealthy.
 
 ### Глобальный обработчик ошибок бота
 
@@ -810,8 +565,8 @@ try/except:
 
 Сам обработчик не поднимает исключений: запись в БД и ответ пользователю
 обёрнуты в try/except (если БД или MAX API недоступны — только лог).
-Scheduler-циклы (`bot/scheduler.py`) обрабатывают свои ошибки самостоятельно
-и через обработчик polling-цикла не проходят.
+Фоновые циклы (`slot_scheduler_loop`, сводка, бэкап) обрабатывают свои ошибки
+самостоятельно и через обработчик polling-цикла не проходят.
 
 ### Миграции
 
@@ -820,11 +575,14 @@ Scheduler-циклы (`bot/scheduler.py`) обрабатывают свои ош
 - v1 — существующие таблицы (`sent_news`, `bot_stats`, `sources_state`)
   идемпотентно: прод-БД со старой версией `user_version = 0` корректно
   поднимается до актуальной;
-- v2 — таблица `posts` с полным набором колонок (см. «Машина состояний posts»);
+- v2 — таблица `posts` (legacy фабрики: код её больше не пишет, схема создаётся,
+  чтобы прод-БД поднималась без пересборки — ADR-004);
 - v3 — `posts.message_id` INTEGER → TEXT (mid — строка `mid.<id>`): таблица
   пересобирается через `posts_new`, шаг начинается с `DROP TABLE IF EXISTS
   posts_new` (реентерабелен после сбоя процесса посреди миграции) и сохраняет
   счётчик AUTOINCREMENT;
+- v4 — таблицы контура рубрик (`slot_runs`, `digest_items`, `rubric_state`,
+  `content_bank`, `filter_log`);
 - перед применением миграций к существующей БД — копия файла БД после
   чекпоинта WAL (откат = вернуть копию).
 
@@ -834,39 +592,38 @@ WAL включается на инициализации, `busy_timeout` — н�
 
 ## Конфигурация
 
-`sources.yaml` хранит только несекретные настройки:
+`rubrics.yaml` — конфиг единственного контура (валидация при старте, опечатка
+роняет запуск): сетка рубрик, `persona` канала, `targets`, `daily_cap`, погода,
+генерация картинок и LLM-каналы (перенесены сюда из удалённого `sources.yaml`):
 
 ```yaml
-settings:
-  post_interval_hours: 6
-  max_news_per_source: 5
-  request_timeout: 30
+timezone: "Europe/Moscow"
+persona: |
+  Ты — редактор канала для читателей старшего возраста ...
 
-filters:
-  include_keywords: []
-  exclude_keywords: []
+llm:
+  # первичный LLM-канал (ADR-002); ключ — только в env
+  base_url: "https://openrouter.ai/api/v1"
+  model: "qwen/qwen3.8-flash"
+  disable_reasoning: true
+  timeout: 60
+  max_tokens: 800
+  temperature: 0.7
+llm_fallback:
+  base_url: "https://ai.api.cloud.yandex.net/v1"
+  model: "gpt://<folder_id>/yandexgpt-5-lite"
 
-sources:
-  - name: "Python Insider"
-    type: "rss"
-    url: "https://pythoninsider.blogspot.com/feeds/posts/default"
-    enabled: true
-    category: "python"
+targets:
+  main:
+    channel_id_env: MAX_CHANNEL_ID
+daily_cap: 6
+summary_time: "22:40"
 
-factory:
-  enabled: false
-  dry_run: true
-  interval_hours: 4
-  active_hours: "08:00-23:00"
-  timezone: "Europe/Moscow"
-  llm:
-    # первичный LLM-канал (ADR-002)
-    base_url: "https://openrouter.ai/api/v1"
-    model: "qwen/qwen3.8-flash"
-  llm_fallback:
-    # резервный LLM-канал; timeout/max_tokens/temperature общие с primary
-    base_url: "https://ai.api.cloud.yandex.net/v1"
-    model: "gpt://<folder_id>/yandexgpt-5-lite"
+rubrics:
+  - id: good_morning
+    time: "07:00"          # в yaml времени — в кавычках (YAML 1.1 парсит 12:30 как число)
+    kind: bank             # bank | generative | weather | digest
+    ...
 ```
 
 `.env` хранит секреты и runtime-переопределения (полный список с комментариями —
@@ -877,8 +634,6 @@ MAX_BOT_TOKEN=
 MAX_CHANNEL_ID=
 ADMIN_IDS=
 LOG_LEVEL=INFO
-POST_INTERVAL_HOURS=6
-REQUEST_TIMEOUT=30
 DATABASE_PATH=
 OPENROUTER_API_KEY=
 LLM_API_KEY=
@@ -887,14 +642,13 @@ LLM_MODEL=
 LLM_FALLBACK_BASE_URL=
 LLM_FALLBACK_MODEL=
 FAL_KEY=
-FACTORY_ENABLED=
-FACTORY_DRY_RUN=
-FACTORY_INTERVAL_HOURS=
-FACTORY_ACTIVE_HOURS=
+RUBRICS_DRY_RUN=
+RUBRICS_CONFIG_PATH=
 ```
 
 `LLM_BASE_URL`/`LLM_MODEL` переопределяют первичный канал (OpenRouter),
-`LLM_FALLBACK_BASE_URL`/`LLM_FALLBACK_MODEL` — резервный (Yandex).
+`LLM_FALLBACK_BASE_URL`/`LLM_FALLBACK_MODEL` — резервный (Yandex);
+`RUBRICS_DRY_RUN=false` переключает превью админам на публикацию в канал.
 
 Переменные окружения имеют приоритет над YAML, чтобы настройки можно было менять в Docker без пересборки образа. Прокси-переменных нет: обе платформы (MAX, Yandex) доступны из РФ напрямую (ADR-001).
 
@@ -927,7 +681,7 @@ CREATE TABLE sources_state (
 );
 ```
 
-Отдельная миграционная система не нужна: создание и изменения схемы живут в `utils/db.py` в одном месте, версия схемы — `PRAGMA user_version` (v1 — таблицы дайджеста идемпотентно, v2 — таблица `posts` фабрики, v3 — `posts.message_id` в TEXT под строковые mid, с копией БД перед применением; см. «Миграции» в разделе «Контент-фабрика»). Флаги управления фабрикой (`factory`, `factory_autopause`) переиспользуют `sources_state`.
+Отдельная миграционная система не нужна: создание и изменения схемы живут в `utils/db.py` в одном месте, версия схемы — `PRAGMA user_version` (v1 — базовые таблицы, v2/v3 — legacy `posts` фабрики, v4 — таблицы контура рубрик; перед применением к существующей БД — копия файла после чекпоинта WAL, см. «Миграции»). Таблицы `sent_news`/`posts`/`sources_state` — замороженная история: код их больше не пишет, рабочий контур живёт в `slot_runs`/`content_bank`/`digest_items` (ADR-004).
 
 ---
 
@@ -941,7 +695,7 @@ CREATE TABLE sources_state (
 Минимальный формат логов:
 
 ```text
-2026-05-25 12:00:00 INFO max_news_bot.pipeline collected=12 published=5 skipped=7
+2026-05-25 12:00:00 INFO max_news_bot.bot.slot_scheduler published=1 skipped=0 failed=0
 2026-05-25 12:00:02 ERROR max_news_bot.parsers.rss source=Example error="timeout"
 ```
 
@@ -989,16 +743,15 @@ services:
 
 Минимальный набор тестов:
 
-- `test_loader.py` — YAML читается, env-переменные переопределяют настройки;
-- `test_filters.py` — include/exclude ключевые слова работают ожидаемо;
-- `test_pipeline.py` — новая новость публикуется, дубликат пропускается;
-- `test_formatter.py` — сообщение не превышает лимит MAX (4000);
-- `test_db.py`, `test_text.py` — миграции, UPSERT/`last_attempt_at`, флаги, канонизация URL, Jaccard;
-- `test_factory.py` — recovery, attempts только за контентное, circuit breaker, автопауза на 401/404, лимиты, дедуп, тихие часы;
-- `test_llm_writer.py` — `LlmWriter` против локального aiohttp-тест-сервера (`/chat/completions`: 200/401/404/429/500, таймаут, мусорный JSON);
-- `test_validator.py`, `test_sanitize.py` — границы длин, отказ-фразы, «злые» кейсы санитайзера;
-- `test_architecture.py` — инварианты: core не импортирует `max_api`, в зависимостях нет aiogram/aiohttp-socks;
-- `test_healthcheck.py` — правила healthcheck на временной SQLite-базе.
+- `test_loader.py` — env читается, rubrics.yaml подхватывается, dry-run требует `ADMIN_IDS`;
+- `test_rubrics_config.py` — валидация сетки и LLM-секций (fail-fast на опечатку);
+- `test_slot_scheduler.py` — захват слотов, recovery, выключатели, daily_cap;
+- `test_main_contour.py` — старт единственного контура, проба LLM-каналов до задач;
+- `test_fallback_llm.py` — `FallbackCompletion` против локальных aiohttp-серверов (200/401/429/500, мусорный JSON), события и алерты;
+- `test_rubrics_runtime.py` — сборка контура, binding пайплайнов, проба каналов;
+- `test_formatter.py`, `test_validator.py`, `test_sanitize.py` — границы длин, «злые» кейсы санитайзера;
+- `test_architecture.py` — инварианты: в зависимостях нет aiogram/тяжёлых библиотек;
+- `test_healthcheck.py` — правила healthcheck (только слоты) на временной SQLite-базе.
 
 Интеграционные тесты с реальным MAX API на MVP не нужны. MAX лучше мокать через
 `Publisher`/`MaxClient`.
@@ -1023,13 +776,7 @@ pytest-asyncio
 (`max-botapi-python`, `aiomax`) — см. ADR-001.
 
 Зависимости задаются в `pyproject.toml` (корень репозитория), локально — `uv sync`.
-
-HTML-зависимости добавляются позже:
-
-```text
-beautifulsoup4
-lxml
-```
+HTML-зависимостей (beautifulsoup4, lxml) не будет: RSS-only — архитектурное решение.
 
 ---
 
@@ -1037,15 +784,12 @@ lxml
 
 Проект развивается от маленького production-бота, а не от большой платформы.
 
-В MVP реализуются только RSS, дедупликация, MAX-публикация (собственный тонкий
-клиент + long polling), Docker, логи, lock и базовые команды. Для будущей фабрики
-контента заранее вводятся только две легкие границы: `NewsItem` и `Publisher`.
+Проект — маленький production-бот одной тематики: слотовый планировщик рубрик,
+RSS-only сбор для дайджеста, MAX-публикация собственным тонким клиентом,
+двухканальный LLM с per-request failover, Docker и наблюдаемость.
 
-Контент-фабрика добавлена вторым параллельным циклом, не сломав этих границ:
-`Publisher` остался контрактом дайджеста, а фабрика получила свои протоколы
-(`Writer`, `PostPublisherProtocol`, `Alerter`) — см. «Контент-фабрика».
-
-Порт на MAX + Yandex AI Studio (ADR-001) прошёл по этим же границам: ядро не
-изменилось, платформенная специфика сосредоточена в `max_api` и `publishers`,
-LLM-провайдер переключился переменными окружения. Такой подход сохраняет проект
-простым сейчас и не мешает встроить его в более крупную систему позже.
+Контур стал единственным (ADR-004): legacy-циклы удалены, их роль закрыла слотовая
+машина состояний. Порт на MAX + Yandex AI Studio (ADR-001) и failover LLM (ADR-002)
+прошли по прежним границам: платформенная специфика сосредоточена в `max_api` и
+`publishers`. Такой подход сохраняет проект простым и не мешает встроить его в
+более крупную систему позже.

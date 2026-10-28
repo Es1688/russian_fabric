@@ -8,7 +8,6 @@ from test_slot_scheduler.
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import replace
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -20,8 +19,7 @@ from max_news_bot.bot.handlers import create_dispatcher
 from max_news_bot.bot.rubrics_admin import RubricsAdmin, format_tick_result
 from max_news_bot.bot.slot_scheduler import TickResult, SlotScheduler
 from max_news_bot.config.loader import AppConfig
-from max_news_bot.core.pipeline import Pipeline
-from max_news_bot.tests.mocks import MockAlerter, MockFetcher, MockPublisher
+from max_news_bot.tests.mocks import MockAlerter
 from max_news_bot.tests.test_handlers import CHAT_ID, RecordingClient, make_update
 from max_news_bot.tests.test_slot_scheduler import (
     FakePipeline,
@@ -101,13 +99,10 @@ async def admin_setup(tmp_path: Path, app_config: AppConfig) -> SimpleNamespace:
     db = Database(path)
     await db.initialize()
     client = RecordingClient()
-    pipeline = Pipeline(app_config, MockFetcher(), MockPublisher(), db)
     admin = _make_admin(path, db)
     handle_update = create_dispatcher(
         app_config,
-        pipeline,
         db,
-        asyncio.Lock(),
         datetime.now(timezone.utc),
         client=client,
         rubrics_admin=admin,
@@ -215,7 +210,6 @@ async def test_factory_run_rubric_respects_daily_cap(tmp_path, app_config) -> No
     path = tmp_path / "cap.db"
     db = Database(path)
     await db.initialize()
-    pipeline = Pipeline(app_config, MockFetcher(), MockPublisher(), db)
     client = RecordingClient()
     admin = _make_admin(
         path,
@@ -225,9 +219,7 @@ async def test_factory_run_rubric_respects_daily_cap(tmp_path, app_config) -> No
     )
     handle_update = create_dispatcher(
         app_config,
-        pipeline,
         db,
-        asyncio.Lock(),
         datetime.now(timezone.utc),
         client=client,
         rubrics_admin=admin,
@@ -244,12 +236,10 @@ async def test_factory_run_rubric_respects_daily_cap(tmp_path, app_config) -> No
     assert "weather (daily_cap)" in last
 
 
-async def test_factory_bare_run_ticks_scheduler_in_rubrics_contour(
-    admin_setup,
-) -> None:
-    # 12:00 UTC is past the 07:00 slot + grace: the tick records a
-    # missed_grace skip instead of executing it
-    await _invoke(admin_setup, "/factory")
+async def test_factory_bare_run_ticks_scheduler(admin_setup) -> None:
+    # bare /factory run = one immediate scheduler tick; 12:00 UTC is past
+    # the 07:00 slot + grace: the tick records a missed_grace skip
+    await _invoke(admin_setup, "/factory run")
 
     texts = _texts(admin_setup)
     assert "Running scheduler tick..." in texts
@@ -271,9 +261,6 @@ async def test_factory_status_appends_rubrics_overview(admin_setup) -> None:
     await _invoke(admin_setup, "/factory status")
 
     status = _last_text(admin_setup)
-    # legacy part is intact
-    assert "Factory: enabled (config)" in status
-    # rubrics part
     assert "Rubrics: enabled, timezone UTC, daily_cap 6" in status
     assert "Global MAX pause: no" in status
     assert "- good_morning (bank, 07:00): active; today: published" in status
@@ -323,78 +310,27 @@ async def test_factory_retract_slot_usage_without_id(admin_setup) -> None:
     assert "Usage: /factory retract slot &lt;run_id&gt;" in _last_text(admin_setup)
 
 
-# --- legacy forms keep working with the contour attached -------------------------
+# --- bare pause/resume pause every rubric ------------------------------------------
 
 
-async def test_legacy_pause_stops_factory_flag_and_all_rubrics(admin_setup) -> None:
+async def test_bare_pause_pauses_all_rubrics(admin_setup) -> None:
     await _invoke(admin_setup, "/factory pause")
 
     text = _last_text(admin_setup)
-    assert "Factory paused. Use /factory resume to continue." in text
     assert "All rubrics paused (2)" in text
-    assert await admin_setup.db.get_state_flag("factory") is False
     states = RubricStateRepository(admin_setup.path)
     assert (await states.get("weather")).paused is True
+    assert (await states.get("good_morning")).paused is True
 
 
-async def test_legacy_resume_clears_factory_flags_and_all_rubrics(
-    admin_setup,
-) -> None:
+async def test_bare_resume_clears_every_pause(admin_setup) -> None:
     await _invoke(admin_setup, "/factory pause")
     await _invoke(admin_setup, "/factory resume")
 
     text = _last_text(admin_setup)
-    assert "Factory resumed (manual pause and auto-pause cleared)." in text
     assert "All rubrics resumed (2)" in text
-    assert await admin_setup.db.get_state_flag("factory") is True
-    assert await admin_setup.db.get_state_flag("factory_autopause") is True
-
-
-# --- backward compatibility: rubric arguments without the contour -----------------
-
-
-@pytest.fixture
-async def legacy_setup(tmp_path: Path, app_config: AppConfig) -> SimpleNamespace:
-    db = Database(tmp_path / "legacy.db")
-    await db.initialize()
-    client = RecordingClient()
-    pipeline = Pipeline(app_config, MockFetcher(), MockPublisher(), db)
-    handle_update = create_dispatcher(
-        app_config,
-        pipeline,
-        db,
-        asyncio.Lock(),
-        datetime.now(timezone.utc),
-        client=client,
-    )
-    return SimpleNamespace(
-        handle_update=handle_update, client=client, db=db, app_config=app_config
-    )
-
-
-async def test_rubric_arguments_answer_disabled_without_contour(
-    legacy_setup,
-) -> None:
-    for command in (
-        "/factory pause weather",
-        "/factory pause all",
-        "/factory resume weather",
-        "/factory run weather",
-        "/factory retract slot 1",
-    ):
-        await _invoke(legacy_setup, command)
-        assert _last_text(legacy_setup) == (
-            "Rubrics contour is disabled (check RUBRICS_ENABLED)."
-        )
-
-
-async def test_legacy_pause_without_contour_untouched(legacy_setup) -> None:
-    await _invoke(legacy_setup, "/factory pause")
-
-    assert _last_text(legacy_setup) == (
-        "Factory paused. Use /factory resume to continue."
-    )
-    assert await legacy_setup.db.get_state_flag("factory") is False
+    states = RubricStateRepository(admin_setup.path)
+    assert (await states.get("weather")).paused is False
 
 
 # --- format_tick_result ------------------------------------------------------------

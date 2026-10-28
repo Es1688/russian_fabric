@@ -24,6 +24,7 @@ from max_news_bot.weather.base import (
     WeatherProviderError,
     WeatherSnapshot,
 )
+from max_news_bot.tests.conftest import make_llm_channels
 from max_news_bot.weather.pipeline import WeatherPipeline
 
 from max_news_bot.tests.weather_builders import full_snapshot
@@ -33,7 +34,7 @@ NOW = datetime(2026, 10, 10, 4, 30, tzinfo=timezone.utc)
 
 def make_config(*rubrics: RubricConfig) -> RubricsConfig:
     return RubricsConfig(
-        enabled=True,
+        llm=make_llm_channels(),
         timezone="Europe/Moscow",
         persona="persona",
         image_style="style",

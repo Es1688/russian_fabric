@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import aiohttp
 
-from max_news_bot.config.loader import FactoryConfig, LlmConfig
+from max_news_bot.config.rubrics import LlmChannelsConfig, LlmConfig
 from max_news_bot.utils.logging import get_logger
 from max_news_bot.writers.completion import LlmCompletionClient, LlmCompletionError
 
@@ -78,14 +78,14 @@ async def probe_llm_channel(
 
 
 async def probe_llm_channels(
-    factory: FactoryConfig,
+    channels: LlmChannelsConfig,
     session: aiohttp.ClientSession | None,
 ) -> None:
     """Probe the primary channel and, when configured, the fallback —
     the failover wiring decides which channels exist, this only mirrors
     it (callers probe exactly the channels they have wired)."""
-    channels: list[tuple[str, LlmConfig]] = [("primary", factory.llm)]
-    if factory.llm_fallback is not None:
-        channels.append(("fallback", factory.llm_fallback))
-    for channel, llm in channels:
+    wired: list[tuple[str, LlmConfig]] = [("primary", channels.primary)]
+    if channels.fallback is not None:
+        wired.append(("fallback", channels.fallback))
+    for channel, llm in wired:
         await probe_llm_channel(channel, llm, session)

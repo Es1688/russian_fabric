@@ -1,25 +1,27 @@
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 
 from max_news_bot.bot.handlers import BOT_COMMANDS, create_dispatcher
+from max_news_bot.bot.rubrics_admin import RubricsAdmin
+from max_news_bot.bot.slot_scheduler import SlotScheduler
 from max_news_bot.config.loader import AppConfig
-from max_news_bot.core.factory import ContentFactory
-from max_news_bot.core.models import Post
-from max_news_bot.core.pipeline import Pipeline, PipelineResult
-from max_news_bot.tests.mocks import (
-    MockAlerter,
-    MockFetcher,
-    MockPostPublisher,
-    MockPublisher,
-    MockWriter,
-)
+from max_news_bot.tests.mocks import MockAlerter
 from max_news_bot.utils.db import Database
+from max_news_bot.utils.repositories import (
+    RubricStateRepository,
+    SlotRunRepository,
+)
+from max_news_bot.tests.test_slot_scheduler import (
+    FakePipeline,
+    FakeSlotPublisher,
+    make_config,
+    make_rubric,
+)
 
 
 CHAT_ID = -100200300
@@ -95,68 +97,47 @@ async def _invoke(
     )
 
 
-def _make_post(**overrides) -> Post:
-    fields: dict = dict(
-        id=None,
-        news_url="https://example.com/news/1",
-        source="Test RSS",
-        title="Python release improves compiler speed",
-        text=None,
-        status="draft",
+def _make_admin(db: Database) -> RubricsAdmin:
+    config = make_config(
+        [
+            make_rubric("good_morning"),
+            make_rubric("weather", kind="weather", on_llm_failure="skip"),
+        ]
     )
-    fields.update(overrides)
-    return Post(**fields)
-
-
-@pytest.fixture
-def handler_setup(app_config: AppConfig, db: Database):
-    pipeline = Pipeline(app_config, MockFetcher(), MockPublisher(), db)
-    client = RecordingClient()
-    handle_update = create_dispatcher(
-        app_config,
-        pipeline,
+    scheduler = SlotScheduler(
+        config,
+        SlotRunRepository(db.path),
+        RubricStateRepository(db.path),
+        FakePipeline(),
+        FakeSlotPublisher(),
+        MockAlerter(),
+    )
+    return RubricsAdmin(
+        config,
+        scheduler,
+        SlotRunRepository(db.path),
+        RubricStateRepository(db.path),
         db,
-        asyncio.Lock(),
-        datetime.now(timezone.utc),
-        client=client,
-    )
-    return SimpleNamespace(
-        handle_update=handle_update,
-        pipeline=pipeline,
-        client=client,
-        db=db,
-        app_config=app_config,
     )
 
 
 @pytest.fixture
-def factory_setup(app_config: AppConfig, db: Database):
-    fetcher = MockFetcher()
-    publisher = MockPublisher()
-    pipeline = Pipeline(app_config, fetcher, publisher, db)
-    writer = MockWriter()
-    factory = ContentFactory(
-        app_config, fetcher, writer, MockPostPublisher(), MockAlerter(), db
-    )
+def handler_setup(app_config: AppConfig, db: Database, tmp_path: Path):
     client = RecordingClient()
+    admin = _make_admin(db)
     handle_update = create_dispatcher(
         app_config,
-        pipeline,
         db,
-        asyncio.Lock(),
         datetime.now(timezone.utc),
-        factory=factory,
-        factory_lock=asyncio.Lock(),
         client=client,
+        rubrics_admin=admin,
     )
     return SimpleNamespace(
         handle_update=handle_update,
-        pipeline=pipeline,
-        factory=factory,
-        writer=writer,
         client=client,
         db=db,
         app_config=app_config,
+        admin=admin,
     )
 
 
@@ -169,11 +150,8 @@ def test_bot_commands_registry_shape() -> None:
         "start",
         "chatid",
         "status",
-        "sources",
         "stats",
-        "news",
         "factory",
-        "posts",
     ]
     assert not any(entry["name"].startswith("/") for entry in BOT_COMMANDS)
 
@@ -211,147 +189,83 @@ async def test_chatid_replies_with_chat_id_and_user_id(handler_setup) -> None:
     assert "ADMIN_IDS" in text
 
 
-# --- /news --------------------------------------------------------------------
-
-
-async def test_news_allowed_for_admin(handler_setup) -> None:
-    with patch.object(
-        handler_setup.pipeline,
-        "run",
-        new=AsyncMock(
-            return_value=PipelineResult(collected=1, filtered=1, published=1, skipped=0)
-        ),
-    ) as mock_run:
-        await _invoke(handler_setup, "/news", user_id=handler_setup.app_config.admin_ids[0])
-
-    mock_run.assert_awaited_once()
-    texts = _texts(handler_setup)
-    assert "Running pipeline..." in texts
-    assert "Pipeline done: collected=1 published=1" in texts
-    assert not any("Access denied" in text for text in texts)
-
-
-async def test_news_denied_for_non_admin(handler_setup) -> None:
-    with patch.object(
-        handler_setup.pipeline, "run", new=AsyncMock()
-    ) as mock_run:
-        await _invoke(handler_setup, "/news")
-
-    mock_run.assert_not_awaited()
-    assert _texts(handler_setup) == ["Access denied."]
-
-
-# --- /status /sources /stats --------------------------------------------------
+# --- /status /stats -----------------------------------------------------------
 
 
 async def test_status_command_responds(handler_setup, db: Database) -> None:
-    await db.log_event("run", "collected=1")
+    await db.log_event("slot_heartbeat", "quiet")
 
     await _invoke(handler_setup, "/status")
 
     texts = _texts(handler_setup)
     assert any("Uptime:" in text for text in texts)
-    assert any("Last run:" in text for text in texts)
+    assert any("Last scheduler heartbeat:" in text for text in texts)
     assert any("Last error:" in text for text in texts)
 
 
-async def test_sources_command_lists_sources(handler_setup) -> None:
-    await _invoke(handler_setup, "/sources")
-
-    texts = _texts(handler_setup)
-    assert any("Test RSS" in text and "enabled" in text for text in texts)
-    assert any("Disabled RSS" in text and "disabled" in text for text in texts)
-
-
 async def test_stats_command_responds(handler_setup, db: Database) -> None:
-    await db.log_event("publish", "published=1")
+    # /stats reads publications from slot_runs and errors from bot_stats
+    runs = SlotRunRepository(db.path)
+    run = await runs.try_claim(
+        "good_morning", "2026-10-28", target="-1001234567890", is_dry_run=False
+    )
+    await runs.save(_published(run))
 
     await _invoke(handler_setup, "/stats")
 
-    assert any("Daily stats:" in text for text in _texts(handler_setup))
+    texts = _texts(handler_setup)
+    assert any("Daily stats:" in text for text in texts)
+    assert any("publish=1" in text for text in texts)
+
+
+def _published(run):
+    from dataclasses import replace
+
+    return replace(
+        run, status="published", published_at=datetime.now(timezone.utc)
+    )
 
 
 # --- /factory -----------------------------------------------------------------
 
 
-async def test_factory_run_allowed_for_admin(factory_setup) -> None:
-    await _invoke(
-        factory_setup, "/factory run", user_id=factory_setup.app_config.admin_ids[0]
-    )
+async def test_factory_status_shows_rubrics(handler_setup) -> None:
+    await _invoke(handler_setup, "/factory status", user_id=handler_setup.app_config.admin_ids[0])
 
-    texts = _texts(factory_setup)
+    texts = _texts(handler_setup)
+    assert any("good_morning" in text for text in texts)
     assert not any("Access denied" in text for text in texts)
-    assert "Running factory cycle..." in texts
-    assert any("Factory cycle done:" in text for text in texts)
 
 
-async def test_factory_bare_command_still_runs_factory_cycle(factory_setup) -> None:
-    # backward compatibility: /factory without arguments equals /factory run
-    await _invoke(factory_setup, "/factory", user_id=factory_setup.app_config.admin_ids[0])
+async def test_factory_bare_command_shows_status(handler_setup) -> None:
+    # /factory without arguments answers with the status overview
+    await _invoke(handler_setup, "/factory", user_id=handler_setup.app_config.admin_ids[0])
 
-    texts = _texts(factory_setup)
-    assert "Running factory cycle..." in texts
-    assert any("Factory cycle done:" in text for text in texts)
+    assert any("good_morning" in text for text in _texts(handler_setup))
 
 
-async def test_factory_run_reports_disabled_when_no_factory(handler_setup) -> None:
-    await _invoke(handler_setup, "/factory run", user_id=handler_setup.app_config.admin_ids[0])
+async def test_factory_denied_for_non_admin(handler_setup) -> None:
+    await _invoke(handler_setup, "/factory")
 
-    assert any("Factory is disabled" in text for text in _texts(handler_setup))
-
-
-async def test_factory_denied_for_non_admin(factory_setup) -> None:
-    await _invoke(factory_setup, "/factory")
-
-    assert _texts(factory_setup) == ["Access denied."]
-    assert factory_setup.writer.calls == []
+    assert _texts(handler_setup) == ["Access denied."]
 
 
-async def test_factory_pause_sets_flag(factory_setup) -> None:
+async def test_factory_pause_all_pauses_rubrics(handler_setup) -> None:
     await _invoke(
-        factory_setup, "/factory pause", user_id=factory_setup.app_config.admin_ids[0]
+        handler_setup, "/factory pause all", user_id=handler_setup.app_config.admin_ids[0]
     )
 
-    assert any("paused" in text.lower() for text in _texts(factory_setup))
-    assert await factory_setup.db.get_state_flag("factory") is False
+    assert any("paused" in text.lower() for text in _texts(handler_setup))
+    states = RubricStateRepository(handler_setup.db.path)
+    assert (await states.get("good_morning")).paused is True
 
 
-async def test_factory_resume_clears_both_pauses(factory_setup) -> None:
-    db = factory_setup.db
-    await db.set_state_flag("factory", False)
-    await db.set_state_flag("factory_autopause", False)
-
+async def test_factory_usage_hint_on_unknown_action(handler_setup) -> None:
     await _invoke(
-        factory_setup, "/factory resume", user_id=factory_setup.app_config.admin_ids[0]
+        handler_setup, "/factory frobnicate", user_id=handler_setup.app_config.admin_ids[0]
     )
 
-    assert await db.get_state_flag("factory") is True
-    assert await db.get_state_flag("factory_autopause") is True
-    assert any("resumed" in text.lower() for text in _texts(factory_setup))
-
-
-async def test_factory_status_shows_state(factory_setup) -> None:
-    await factory_setup.db.set_state_flag("factory", False)
-    await factory_setup.db.set_state_flag("factory_autopause", False)
-    await factory_setup.db.log_event("factory_alert", "kind=config error=llm http 401")
-
-    await _invoke(
-        factory_setup, "/factory status", user_id=factory_setup.app_config.admin_ids[0]
-    )
-
-    texts = _texts(factory_setup)
-    assert any("enabled" in text for text in texts)
-    assert any("Paused (manual): yes" in text for text in texts)
-    assert any("Auto-paused: yes" in text for text in texts)
-    assert any("llm http 401" in text for text in texts)
-
-
-async def test_factory_usage_hint_on_unknown_action(factory_setup) -> None:
-    await _invoke(
-        factory_setup, "/factory frobnicate", user_id=factory_setup.app_config.admin_ids[0]
-    )
-
-    hint = _texts(factory_setup)[0]
+    hint = _texts(handler_setup)[0]
     assert "Usage: /factory" in hint
     # the hint documents the rubric argument (plan section 11); angle
     # brackets are html-escaped because replies go as fmt=html
@@ -359,128 +273,18 @@ async def test_factory_usage_hint_on_unknown_action(factory_setup) -> None:
     assert "/factory retract slot &lt;run_id&gt;" in hint
 
 
-async def test_factory_rubric_argument_answers_disabled_without_contour(
-    factory_setup,
-) -> None:
+async def test_factory_retract_requires_slot_keyword(handler_setup) -> None:
     await _invoke(
-        factory_setup,
-        "/factory pause weather",
-        user_id=factory_setup.app_config.admin_ids[0],
+        handler_setup,
+        "/factory retract 5",
+        user_id=handler_setup.app_config.admin_ids[0],
     )
 
-    assert _texts(factory_setup) == [
-        "Rubrics contour is disabled (check RUBRICS_ENABLED)."
-    ]
-
-
-async def test_factory_retract_deletes_channel_message(factory_setup) -> None:
-    post_id = await factory_setup.db.save_attempt(_make_post(status="draft"))
-    await factory_setup.db.mark_post_published(post_id, "mid.555")
-
-    await _invoke(
-        factory_setup,
-        f"/factory retract {post_id}",
-        user_id=factory_setup.app_config.admin_ids[0],
+    # the legacy post-id form is gone: only /factory retract slot <run_id>
+    assert any(
+        "Usage: /factory retract slot" in text for text in _texts(handler_setup)
     )
-
-    # MaxClient.delete_message takes the message id only (no chat_id)
-    assert factory_setup.client.deleted == ["mid.555"]
-    assert any("retracted" in text for text in _texts(factory_setup))
-    event = await factory_setup.db.get_last_event("factory_retract")
-    assert event is not None
-    assert f"id={post_id}" in event["details"]
-
-
-async def test_factory_retract_refuses_previewed_post(factory_setup) -> None:
-    post_id = await factory_setup.db.save_attempt(_make_post(status="previewed"))
-
-    await _invoke(
-        factory_setup,
-        f"/factory retract {post_id}",
-        user_id=factory_setup.app_config.admin_ids[0],
-    )
-
-    assert factory_setup.client.deleted == []
-    assert any("Cannot retract" in text for text in _texts(factory_setup))
-
-
-async def test_factory_retract_unknown_post(factory_setup) -> None:
-    await _invoke(
-        factory_setup,
-        "/factory retract 12345",
-        user_id=factory_setup.app_config.admin_ids[0],
-    )
-
-    assert factory_setup.client.deleted == []
-    assert any("not found" in text for text in _texts(factory_setup))
-
-
-async def test_factory_retract_reports_api_failure(factory_setup) -> None:
-    factory_setup.client._raise_on_delete = RuntimeError("max is down")
-    post_id = await factory_setup.db.save_attempt(_make_post(status="draft"))
-    await factory_setup.db.mark_post_published(post_id, "mid.556")
-
-    await _invoke(
-        factory_setup,
-        f"/factory retract {post_id}",
-        user_id=factory_setup.app_config.admin_ids[0],
-    )
-
-    assert any("Retract failed" in text for text in _texts(factory_setup))
-    event = await factory_setup.db.get_last_event("factory_retract")
-    assert event is None
-
-
-# --- /posts -------------------------------------------------------------------
-
-
-async def test_posts_lists_recent_posts(factory_setup) -> None:
-    await factory_setup.db.save_attempt(
-        _make_post(status="published", news_url="https://example.com/a")
-    )
-    await factory_setup.db.save_attempt(
-        _make_post(
-            status="failed",
-            news_url="https://example.com/b",
-            error="llm http 429",
-        )
-    )
-
-    await _invoke(factory_setup, "/posts", user_id=factory_setup.app_config.admin_ids[0])
-
-    texts = _texts(factory_setup)
-    assert any("published" in text for text in texts)
-    assert any("failed" in text for text in texts)
-    assert any("llm http 429" in text for text in texts)
-
-
-async def test_posts_denied_for_non_admin(factory_setup) -> None:
-    await _invoke(factory_setup, "/posts")
-
-    assert _texts(factory_setup) == ["Access denied."]
-
-
-async def test_posts_empty_answers_politely(factory_setup) -> None:
-    await _invoke(factory_setup, "/posts", user_id=factory_setup.app_config.admin_ids[0])
-
-    assert any("No posts yet" in text for text in _texts(factory_setup))
-
-
-async def test_posts_escapes_html_in_dynamic_values(factory_setup) -> None:
-    await factory_setup.db.save_attempt(
-        _make_post(
-            status="failed",
-            news_url="https://example.com/x",
-            title="Python <b>3.13</b> & more",
-            error=None,
-        )
-    )
-
-    await _invoke(factory_setup, "/posts", user_id=factory_setup.app_config.admin_ids[0])
-
-    text = _texts(factory_setup)[0]
-    assert "Python &lt;b&gt;3.13&lt;/b&gt; &amp; more" in text
-    assert "<b>3.13</b>" not in text
+    assert handler_setup.client.deleted == []
 
 
 # --- non-commands and malformed updates ---------------------------------------
@@ -543,14 +347,13 @@ async def test_malformed_updates_do_not_raise(handler_setup) -> None:
 
 async def test_handler_crash_replies_and_records_error(handler_setup) -> None:
     with patch.object(
-        handler_setup.pipeline,
-        "run",
-        new=AsyncMock(side_effect=RuntimeError("boom")),
+        handler_setup.admin,
+        "status_text",
+        side_effect=RuntimeError("boom"),
     ):
-        await _invoke(handler_setup, "/news", user_id=handler_setup.app_config.admin_ids[0])
+        await _invoke(handler_setup, "/factory status", user_id=handler_setup.app_config.admin_ids[0])
 
     texts = _texts(handler_setup)
-    assert "Running pipeline..." in texts
     assert (
         "Internal error occurred. Check /status later for details." in texts
     )

@@ -1,19 +1,19 @@
 # Content Fabric MAX — News Bot (MVP)
 
-Бот мессенджера **MAX**: собирает новости из RSS, фильтрует, дедуплицирует в SQLite
-и публикует в канал. В репозитории два взаимоисключающих контура публикации:
+Бот мессенджера **MAX**: ведёт автономный канал для аудитории старшего возраста
+СПб и Ленобласти — суточная сетка рубрик, слотовый планировщик, банк контента,
+погода, «хорошие новости» из RSS с LLM-фильтрами, наблюдаемость. Текст постов
+пишется через двухканальный LLM — OpenRouter (первичный канал) с per-request
+failover на Yandex GPT (резерв). Реализовано по плану
+[docs/plans/2026-10-09-autonomous-channel.md](docs/plans/2026-10-09-autonomous-channel.md).
 
-- **Legacy (по умолчанию)** — дайджест-цикл RSS (Habr, vc.ru по ключевым словам) и
-  контент-фабрика: оригинальные посты через двухканальный LLM — OpenRouter
-  (первичный канал) с per-request failover на Yandex GPT (резерв).
-- **Автономный канал рубрик** (`RUBRICS_ENABLED=true`) — суточная сетка рубрик для
-  аудитории старшего возраста СПб и Ленобласти: слотовый планировщик, банк
-  контента, погода, «хорошие новости» с LLM-фильтрами, наблюдаемость. Реализован
-  по плану [docs/plans/2026-10-09-autonomous-channel.md](docs/plans/2026-10-09-autonomous-channel.md).
+Контур рубрик — **единственный** publishing-контур процесса (ADR-004): раньше
+рядом с ним существовали legacy-циклы (линк-дайджест и контент-фабрика IT-новостей
+из Habr/vc.ru) с переключателем `RUBRICS_ENABLED`/`FACTORY_ENABLED`; они удалены.
 
 Платформы доставки — российские (MAX, Yandex Cloud): прокси не нужны, бот и LLM
-доступны с VPS в РФ напрямую. Ключевые решения порта и двухканального LLM — в
-[ARCHITECTURE.md](ARCHITECTURE.md), разделы ADR-001–ADR-003.
+доступны с VPS в РФ напрямую. Ключевые решения порта, двухканального LLM и
+единого контура — в [ARCHITECTURE.md](ARCHITECTURE.md), разделы ADR-001–ADR-004.
 
 ## Состав репозитория
 
@@ -30,9 +30,9 @@
   - `weather/` — Open-Meteo (batch на 7 точек), резерв met.no, таблица правил,
     шаблон, восход/закат формулой, валидатор
   - `parsers/`, `core/`, `publishers/`, `writers/`, `utils/`, `config/`
-  - `config/sources.yaml` — источники legacy-дайджеста; `config/rubrics.yaml` —
-    сетка и настройки рубрик; `config/news_sources.yaml` — подтверждённый список
-    «мягких» RSS для рубрики «Хорошие новости»
+  - `config/rubrics.yaml` — сетка рубрик и LLM-каналы (единственный конфиг
+    контура); `config/news_sources.yaml` — подтверждённый список «мягких» RSS
+    для рубрики «Хорошие новости»
 - `infra/` — Docker Compose для продакшена (VPS)
 - `.github/workflows/docker.yml` — CI/CD деплой на VPS из ветки `main`
 - [ARCHITECTURE.md](ARCHITECTURE.md) — архитектурные решения (включая ADR-001)
@@ -58,8 +58,8 @@ uv run python -m max_news_bot.main               # запуск
 uv run pytest                                    # тесты
 ```
 
-По умолчанию работает legacy-контур. Контур рубрик включается
-`RUBRICS_ENABLED=true` (подробнее — ниже).
+По умолчанию контур работает в dry-run: посты уходят превью админам. Подробнее —
+ниже, в разделе «Раскатка».
 
 ## Подготовка (prerequisites)
 
@@ -78,7 +78,7 @@ uv run pytest                                    # тесты
    обязан **один раз написать боту `/start`** — в MAX бот не может инициировать
    личную переписку, без этого не доставятся превью фабрики/рубрик и алерты.
 
-### LLM-каналы (фабрика и рубрики)
+### LLM-каналы (рубрики)
 
 Текст постов пишется через двухканальный LLM (ADR-002): каждый вызов сначала
 идёт в первичный канал, при любой ошибке — в резервный (per-request failover
@@ -86,7 +86,7 @@ uv run pytest                                    # тесты
 
 1. **Первичный канал — OpenRouter**: создайте API-ключ на
    [openrouter.ai](https://openrouter.ai) → `OPENROUTER_API_KEY`. Дефолтная
-   модель `qwen/qwen3.8-flash` и endpoint уже вписаны в `sources.yaml`;
+   модель `qwen/qwen3.8-flash` и endpoint уже вписаны в `rubrics.yaml`;
    переопределения — `LLM_BASE_URL` / `LLM_MODEL` (не указывайте там Yandex —
    это молча сделало бы резервный канал первичным).
 2. **Резервный канал — Yandex AI Studio**: в [Yandex Cloud](https://console.yandex.cloud)
@@ -94,9 +94,9 @@ uv run pytest                                    # тесты
    API-ключ AI Studio → `LLM_API_KEY`, скопируйте `folder_id` каталога и
    соберите имя модели → `LLM_FALLBACK_MODEL`: `gpt://<folder_id>/yandexgpt-5-lite`.
    Тот же ключ в будущем обслужит генерацию изображений YandexART.
-3. При активном LLM-контуре (фабрика или LLM-рубрики) обязательны **оба** ключа:
-   отсутствие любого роняет запуск с fail-fast ошибкой — тихая работа с одним
-   каналом ломает заявленную отказоустойчивость.
+3. При включённых рубриках LLM-видов (generative, digest) обязательны **оба**
+   ключа: отсутствие любого роняет запуск с fail-fast ошибкой — тихая работа
+   с одним каналом ломает заявленную отказоустойчивость.
 
 ### Изображения (fal.ai)
 
@@ -118,8 +118,6 @@ fail-fast ошибкой). Второй провайдер YandexART — зар�
 | `MAX_CHANNEL_ID` | chat_id канала MAX (целое число, см. `/chatid`) |
 | `ADMIN_IDS` | **user_id** админов через запятую (не chat_id лички; узнать — `/chatid` в личке с ботом); каждый должен написать боту `/start` |
 | `LOG_LEVEL` | уровень логирования (`INFO`) |
-| `POST_INTERVAL_HOURS` | интервал дайджест-цикла в часах |
-| `REQUEST_TIMEOUT` | таймаут HTTP-запросов (RSS/MAX/LLM), сек |
 | `DATABASE_PATH` | путь к SQLite (в Docker: `/app/data/max_news_bot.db`) |
 | `OPENROUTER_API_KEY` | ключ OpenRouter — **первичный** LLM-канал |
 | `LLM_API_KEY` | ключ Yandex AI Studio — **резервный** LLM-канал (Yandex GPT); тот же ключ обслужит YandexART |
@@ -128,13 +126,8 @@ fail-fast ошибкой). Второй провайдер YandexART — зар�
 | `LLM_FALLBACK_BASE_URL` | база URL резервного канала (дефолт `https://ai.api.cloud.yandex.net/v1`) |
 | `LLM_FALLBACK_MODEL` | модель резервного канала: `gpt://<folder_id>/yandexgpt-5-lite` |
 | `FAL_KEY` | ключ fal.ai — генерация картинок для рубрик с `image: generate`; обязателен при таких рубриках |
-| `FACTORY_ENABLED` | включает/выключает фабрику |
-| `FACTORY_DRY_RUN` | `true` — превью админам, `false` — публикация в канал |
-| `FACTORY_INTERVAL_HOURS` | интервал цикла фабрики в часах |
-| `FACTORY_ACTIVE_HOURS` | окно активности фабрики для healthcheck (`08:00-23:00`) |
-| `RUBRICS_ENABLED` | включает контур рубрик (дефолт `false` — работают legacy-циклы); при `true` legacy-циклы не стартуют, конфликт с `FACTORY_ENABLED` роняет запуск |
-| `RUBRICS_DRY_RUN` | dry-run контура рубрик (дефолт `true`): посты уходят админам из `ADMIN_IDS`, а не в канал; при `true` `ADMIN_IDS` обязателен |
-| `RUBRICS_CONFIG_PATH` | путь к yaml рубрик (дефолт `max_news_bot/config/rubrics.yaml`) |
+| `RUBRICS_DRY_RUN` | dry-run контура (дефолт `true`): посты уходят админам из `ADMIN_IDS`, а не в канал; при `true` `ADMIN_IDS` обязателен |
+| `RUBRICS_CONFIG_PATH` | путь к yaml рубрик (дефолт `max_news_bot/config/rubrics.yaml`; файл обязателен) |
 
 Секреты (`MAX_BOT_TOKEN`, `OPENROUTER_API_KEY`, `LLM_API_KEY`, `FAL_KEY`)
 живут только в `.env` и в git не попадают.
@@ -158,10 +151,10 @@ fail-fast ошибкой). Второй провайдер YandexART — зар�
 
 Ключевые свойства:
 
-- **Взаимоисключаемость режимов** проверяется при старте: активен ровно один
-  контур публикации; конфликтная конфигурация роняет запуск с внятной причиной.
-  `rubrics.yaml` валидируется при старте даже при выключенном контуре — опечатка
-  роняет запуск, а не пост в 07:00.
+- **Единый контур** (ADR-004): рубрики — единственный publishing-контур,
+  переключателей нет; `rubrics.yaml` обязателен, должен содержать хотя бы одну
+  включённую рубрику и полностью валидируется при старте — опечатка роняет
+  запуск, а не пост в 07:00.
 - **Жизненный цикл слота**: захват `INSERT pending` за `UNIQUE(rubric_id,
   slot_date)`, статусы `generated → publishing → published` (+ `skipped`,
   `failed`, `unknown_delivery`); после рестарта `pending` подхватывается,
@@ -214,29 +207,6 @@ docker exec maxnewsbot python /app/max_news_bot/scripts/bank_import.py \
 data-каталога (VPS: `/opt/maxnewsbot/data/postcards/`); импорт сверяет
 существование файла.
 
-## Контент-фабрика (legacy)
-
-Второй, независимый от дайджеста цикл: отбор новостей по своим ключевым словам →
-LLM (двухканальный: OpenRouter — первичный, Yandex GPT — резерв, ADR-002)
-переписывает в оригинальный пост → публикация в тот же
-канал MAX. У фабрики свой интервал, своя дедупликация и свои лимиты. При
-`RUBRICS_ENABLED=true` цикл фабрики не стартует. Подробности — в
-[ARCHITECTURE.md](ARCHITECTURE.md), раздел «Контент-фабрика».
-
-### Безопасная раскатка
-
-Автопубликация включается только после раскатки; переход на следующий этап —
-только при выполнении критериев предыдущего:
-
-1. **Dry-run** (`FACTORY_DRY_RUN=true`): посты генерируются и уходят админам в
-   личку, а не в канал. Критерии выхода: не менее 20 постов; владелец оценил бы
-   ≥90% как «опубликовал бы»; 0 ложных срабатываний валидатора; 0 полностью
-   неудачных циклов (`written == 0` и `failed > 0`).
-2. **Тестовый канал**: `MAX_CHANNEL_ID` указывает на тестовый канал; 2–3 дня с
-   теми же критериями; `/factory retract` проверен вручную.
-3. **Прод**: `posts_per_cycle: 1`, неделя без инцидентов — затем постепенное
-   увеличение.
-
 ## Docker
 
 Build context — **корень репозитория** (pyproject.toml и uv.lock лежат в корне
@@ -285,7 +255,8 @@ SSH на VPS (`docker compose -p maxnewsbot up -d`). Схема и имена ш
 
 ## Полезные команды бота
 
-`/status`, `/sources`, `/stats`, `/news` (ручной сбор), `/chatid`, `/posts`,
-`/factory run|pause|resume|status|retract` (в контуре рубрик — с аргументом
-рубрики или `all`, например `/factory pause weather`). Команды управления —
-только для `ADMIN_IDS`.
+`/start`, `/chatid`, `/status`, `/stats` и `/factory
+run|pause|resume|status|retract slot` — с аргументом рубрики или `all`
+(например, `/factory pause weather`); `/factory run <рубрика>` запускает
+сегодняшний слот вручную под теми же лимитами. Команды управления — только для
+`ADMIN_IDS`.

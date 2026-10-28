@@ -31,12 +31,16 @@ from max_news_bot.bot.rubrics_runtime import (
     build_rubrics_runtime,
 )
 from max_news_bot.bot.slot_scheduler import GenerationOutcome
-from max_news_bot.config.loader import AppConfig, AppSettings, FilterSettings, LlmConfig
-from max_news_bot.config.rubrics import RubricConfig, load_rubrics_config
+from max_news_bot.config.loader import AppConfig
+from max_news_bot.config.rubrics import (
+    LlmChannelsConfig,
+    LlmConfig,
+    RubricConfig,
+    load_rubrics_config,
+)
 from max_news_bot.images import FalImageGenerator, FallbackImageGenerator
 from max_news_bot.rubrics.digest import DigestPipeline
 from max_news_bot.rubrics.generative import GenerativePipeline
-from max_news_bot.tests.conftest import make_factory_config
 from max_news_bot.tests.mocks import MockFetcher
 from max_news_bot.utils.db import Database
 from max_news_bot.weather.pipeline import WeatherPipeline
@@ -155,27 +159,18 @@ async def llm_channels() -> tuple[FakeLlmServer, FakeLlmServer]:
 async def app_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, llm_channels
 ) -> AppConfig:
-    """AppConfig over the shipped rubrics.yaml, contour enabled; both LLM
-    channels point at the local fakes, so every build probes them instead
-    of the real providers."""
+    """AppConfig over the shipped rubrics.yaml; both LLM channels point at
+    the local fakes, so every build probes them instead of the real
+    providers."""
     monkeypatch.setenv("MAX_CHANNEL_ID", "-1001234567890")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-primary-key")
+    monkeypatch.setenv("LLM_API_KEY", "test-fallback-key")
     primary, fallback = llm_channels
-    rubrics = load_rubrics_config(enabled=True)
-    return AppConfig(
-        bot_token="123456789:test-token",
-        channel_id=-1001234567890,
-        admin_ids=[111, 222],
-        log_level="INFO",
-        settings=AppSettings(
-            post_interval_hours=6, max_news_per_source=5, request_timeout=30
-        ),
-        filters=FilterSettings(include_keywords=[], exclude_keywords=[]),
-        sources=[],
-        data_path=tmp_path / "max_news_bot.db",
-        factory=make_factory_config(
-            enabled=False,
-            dry_run=False,
-            llm=LlmConfig(
+    rubrics = load_rubrics_config()
+    rubrics = replace(
+        rubrics,
+        llm=LlmChannelsConfig(
+            primary=LlmConfig(
                 base_url=server_base(primary),
                 model="primary-model",
                 timeout=5,
@@ -183,7 +178,7 @@ async def app_config(
                 temperature=0.7,
                 api_key="test-primary-key",
             ),
-            llm_fallback=LlmConfig(
+            fallback=LlmConfig(
                 base_url=server_base(fallback),
                 model="fallback-model",
                 timeout=5,
@@ -192,6 +187,13 @@ async def app_config(
                 api_key="test-fallback-key",
             ),
         ),
+    )
+    return AppConfig(
+        bot_token="123456789:test-token",
+        channel_id=-1001234567890,
+        admin_ids=[111, 222],
+        log_level="INFO",
+        data_path=tmp_path / "max_news_bot.db",
         rubrics=rubrics,
     )
 
@@ -294,21 +296,23 @@ async def test_runtime_fails_honestly_without_llm_key_for_llm_kinds(
     # honest if it ever sees it anyway
     no_key = replace(
         app_config,
-        factory=make_factory_config(
-            enabled=False,
-            dry_run=False,
-            llm=LlmConfig(
-                base_url="http://localhost:8080/v1",
-                model="test-model",
-                timeout=30,
-                max_tokens=800,
-                temperature=0.7,
-                api_key="",
+        rubrics=replace(
+            app_config.rubrics,
+            llm=LlmChannelsConfig(
+                primary=LlmConfig(
+                    base_url="http://localhost:8080/v1",
+                    model="test-model",
+                    timeout=30,
+                    max_tokens=800,
+                    temperature=0.7,
+                    api_key="",
+                ),
+                fallback=None,
             ),
         ),
     )
 
-    with pytest.raises(ValueError, match="LLM_API_KEY"):
+    with pytest.raises(ValueError, match="LLM channel keys"):
         await build_rubrics_runtime(no_key, db, DummyMaxClient(), None, MockFetcher())
 
 
@@ -326,17 +330,16 @@ async def test_runtime_without_llm_kinds_needs_no_key(
                 for rubric in app_config.rubrics.rubrics
                 if rubric.kind in ("bank", "weather")
             ),
-        ),
-        factory=make_factory_config(
-            enabled=False,
-            dry_run=False,
-            llm=LlmConfig(
-                base_url="http://localhost:8080/v1",
-                model="test-model",
-                timeout=30,
-                max_tokens=800,
-                temperature=0.7,
-                api_key="",
+            llm=LlmChannelsConfig(
+                primary=LlmConfig(
+                    base_url="http://localhost:8080/v1",
+                    model="test-model",
+                    timeout=30,
+                    max_tokens=800,
+                    temperature=0.7,
+                    api_key="",
+                ),
+                fallback=None,
             ),
         ),
     )

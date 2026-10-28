@@ -22,6 +22,7 @@ from max_news_bot.config.rubrics import (
     TargetConfig,
     WEEKDAYS,
 )
+from max_news_bot.tests.conftest import make_llm_channels
 from max_news_bot.core.models import ContentBankItem
 from max_news_bot.images.base import ImageGenerationError
 from max_news_bot.images.fallback import FallbackImageGenerator
@@ -217,7 +218,7 @@ def make_config(
     image_style: str = "",
 ) -> RubricsConfig:
     return RubricsConfig(
-        enabled=True,
+        llm=make_llm_channels(),
         timezone="UTC",
         persona=persona,
         image_style=image_style,

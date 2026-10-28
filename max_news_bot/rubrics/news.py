@@ -22,10 +22,9 @@ from pathlib import Path
 from typing import Sequence
 
 from max_news_bot.bot.slot_scheduler import SourceStat
-from max_news_bot.config.loader import SourceConfig
 from max_news_bot.config.news_sources import NewsSource
 from max_news_bot.core.models import NewsItem
-from max_news_bot.parsers.base import Fetcher
+from max_news_bot.parsers.base import Fetcher, SourceConfig
 from max_news_bot.utils.logging import get_logger
 from max_news_bot.utils.repositories import ShadowNewsRepository
 

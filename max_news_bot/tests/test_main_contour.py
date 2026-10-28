@@ -1,24 +1,19 @@
-"""Startup contour commutation tests (plan sections 8, 14).
+"""Startup tests of the single publishing contour.
 
-``main()`` must run exactly one publishing contour:
+``main()`` always runs the rubrics contour: the slot scheduler plus its
+summary and backup tasks start, and polling is the main awaited task. The
+legacy loops (digest ``scheduler_loop``, factory ``factory_scheduler_loop``)
+are gone together with their env switches.
 
-- RUBRICS_ENABLED=true: the slot scheduler plus its summary and backup
-  tasks start, and neither legacy loop (digest ``scheduler_loop``, factory
-  ``factory_scheduler_loop``) does;
-- flag off (the default): the legacy loops start exactly as before and no
-  rubrics task exists;
-- both contours enabled: ``load_config`` fails fast, and the failure
-  happens on the real startup path - before any task is created.
-
-Dual-channel wiring (plan §2.4/§2.5): in both contours the writer /
-completion is wrapped into the fallback wrapper over two local fake
-channels, and the readiness probe runs before any task starts - a
-config-kind failure (401) of ANY channel fails the launch with ValueError,
-an infra-kind one (500) only warns and the startup continues.
+Dual-channel wiring (plan §2.4/§2.5): the completion is wrapped into the
+fallback wrapper over two local fake channels, and the readiness probe runs
+before any task starts - a config-kind failure (401) of ANY channel fails
+the launch with ValueError, an infra-kind one (500) only warns and the
+startup continues.
 
 The real ``main`` runs against the shipped configs; only the polling
 loop, the loop functions themselves and the two best-effort MAX startup
-calls are replaced, so the commutation under test is the production one.
+calls are replaced, so the startup under test is the production one.
 """
 
 from __future__ import annotations
@@ -34,8 +29,7 @@ from aiohttp import web
 import max_news_bot.main as main_module
 from max_news_bot.max_api.client import MaxClient
 from max_news_bot.writers.completion import LlmCompletionClient
-from max_news_bot.writers.fallback import FallbackCompletion, FallbackWriter
-from max_news_bot.writers.llm import LlmWriter
+from max_news_bot.writers.fallback import FallbackCompletion
 
 
 class LoopRecorder:
@@ -105,8 +99,6 @@ async def _fake_polling(client, handle_update, db) -> None:
 def recorder(monkeypatch: pytest.MonkeyPatch) -> LoopRecorder:
     rec = LoopRecorder()
     for name in (
-        "scheduler_loop",
-        "factory_scheduler_loop",
         "slot_scheduler_loop",
         "daily_summary_loop",
         "daily_backup_loop",
@@ -123,9 +115,8 @@ async def llm_channels(
     monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[FakeLlmServer, FakeLlmServer]:
     """Two local channels wired as primary and fallback through the
-    loader's env overrides; no external network is touched. Any test that
-    activates an LLM contour needs them: the readiness probe must hit the
-    fakes, never the real providers."""
+    loader's env overrides; no external network is touched: the readiness
+    probe must hit the fakes, never the real providers."""
     primary = FakeLlmServer()
     fallback = FakeLlmServer()
     monkeypatch.setenv("LLM_BASE_URL", await primary.start())
@@ -143,22 +134,18 @@ def _base_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
     monkeypatch.setenv("LLM_API_KEY", "test-llm-key")
     monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "max_news_bot.db"))
-    monkeypatch.delenv("FACTORY_ENABLED", raising=False)
-    monkeypatch.delenv("RUBRICS_ENABLED", raising=False)
     monkeypatch.delenv("RUBRICS_CONFIG_PATH", raising=False)
     monkeypatch.delenv("RUBRICS_DRY_RUN", raising=False)
     monkeypatch.delenv("NEWS_SOURCES_PATH", raising=False)
 
 
-async def test_rubrics_mode_starts_contour_tasks_only(
+async def test_main_starts_the_contour_tasks(
     recorder: LoopRecorder,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     llm_channels: tuple[FakeLlmServer, FakeLlmServer],
 ) -> None:
     _base_env(monkeypatch, tmp_path)
-    monkeypatch.setenv("RUBRICS_ENABLED", "true")
-    monkeypatch.setenv("FACTORY_ENABLED", "false")
 
     await asyncio.wait_for(main_module.main(), timeout=10)
 
@@ -169,7 +156,7 @@ async def test_rubrics_mode_starts_contour_tasks_only(
     }
 
 
-async def test_rubrics_mode_dry_run_by_default(
+async def test_main_dry_run_by_default(
     recorder: LoopRecorder,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -178,8 +165,6 @@ async def test_rubrics_mode_dry_run_by_default(
     # the contour starts with admin previews, not channel posts (plan
     # section 14, stage 1); RUBRICS_DRY_RUN is unset on purpose
     _base_env(monkeypatch, tmp_path)
-    monkeypatch.setenv("RUBRICS_ENABLED", "true")
-    monkeypatch.setenv("FACTORY_ENABLED", "false")
 
     captured: dict[str, object] = {}
     real_build = main_module.build_rubrics_runtime
@@ -196,101 +181,13 @@ async def test_rubrics_mode_dry_run_by_default(
     assert captured["dry_run"] is True
 
 
-async def test_legacy_mode_starts_legacy_loops_only(
+async def test_contour_wires_fallback_completion_and_probes_channels(
     recorder: LoopRecorder,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     llm_channels: tuple[FakeLlmServer, FakeLlmServer],
 ) -> None:
     _base_env(monkeypatch, tmp_path)
-    monkeypatch.setenv("RUBRICS_ENABLED", "false")
-    # both legacy cycles on: the factory too, so its loop start is covered
-    monkeypatch.setenv("FACTORY_ENABLED", "true")
-
-    await asyncio.wait_for(main_module.main(), timeout=10)
-
-    assert set(recorder.started) == {"scheduler_loop", "factory_scheduler_loop"}
-
-
-async def test_legacy_mode_without_factory_starts_digest_loop_only(
-    recorder: LoopRecorder, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _base_env(monkeypatch, tmp_path)
-    monkeypatch.setenv("RUBRICS_ENABLED", "false")
-    monkeypatch.setenv("FACTORY_ENABLED", "false")
-
-    await asyncio.wait_for(main_module.main(), timeout=10)
-
-    assert set(recorder.started) == {"scheduler_loop"}
-
-
-async def test_conflicting_contours_fail_fast_before_any_task(
-    recorder: LoopRecorder, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _base_env(monkeypatch, tmp_path)
-    monkeypatch.setenv("RUBRICS_ENABLED", "true")
-    monkeypatch.setenv("FACTORY_ENABLED", "true")
-
-    with pytest.raises(ValueError, match="Conflicting publishing contours"):
-        await asyncio.wait_for(main_module.main(), timeout=10)
-
-    assert recorder.started == []
-
-
-# --- dual-channel wiring (plan §2.4/§2.5) ---------------------------------------
-
-
-async def test_factory_contour_wires_fallback_writer_and_probes_channels(
-    recorder: LoopRecorder,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    llm_channels: tuple[FakeLlmServer, FakeLlmServer],
-) -> None:
-    _base_env(monkeypatch, tmp_path)
-    monkeypatch.setenv("RUBRICS_ENABLED", "false")
-    monkeypatch.setenv("FACTORY_ENABLED", "true")
-    primary, fallback = llm_channels
-
-    real_cls = main_module.ContentFactory
-    built: dict[str, object] = {}
-
-    def spy_factory(config, fetcher, writer, post_publisher, alerter, db):
-        built["writer"] = writer
-        built["alerter"] = alerter
-        return real_cls(config, fetcher, writer, post_publisher, alerter, db)
-
-    monkeypatch.setattr(main_module, "ContentFactory", spy_factory)
-
-    await asyncio.wait_for(main_module.main(), timeout=10)
-
-    writer = built["writer"]
-    assert isinstance(writer, FallbackWriter)
-    assert isinstance(writer._primary, LlmWriter)
-    assert isinstance(writer._fallback, LlmWriter)
-    assert writer._primary._base_url == server_base(primary)
-    assert writer._fallback._base_url == server_base(fallback)
-    # timeout / max_tokens / temperature are shared with the primary
-    assert writer._fallback._timeout == writer._primary._timeout
-    assert writer._fallback._max_tokens == writer._primary._max_tokens
-    # the alert hook is wired to the contour's own alerter
-    assert writer._observer._alerter is built["alerter"]
-    # readiness probe of BOTH channels before the loops started
-    assert len(primary.requests) == 1
-    assert primary.requests[0]["max_tokens"] == 1
-    assert len(fallback.requests) == 1
-    assert fallback.requests[0]["max_tokens"] == 1
-    assert set(recorder.started) == {"scheduler_loop", "factory_scheduler_loop"}
-
-
-async def test_rubrics_contour_wires_fallback_completion_and_probes_channels(
-    recorder: LoopRecorder,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    llm_channels: tuple[FakeLlmServer, FakeLlmServer],
-) -> None:
-    _base_env(monkeypatch, tmp_path)
-    monkeypatch.setenv("RUBRICS_ENABLED", "true")
-    monkeypatch.setenv("FACTORY_ENABLED", "false")
     primary, fallback = llm_channels
 
     captured: dict[str, object] = {}
@@ -334,18 +231,14 @@ async def test_rubrics_contour_wires_fallback_completion_and_probes_channels(
 
 
 @pytest.mark.parametrize("channel", ["primary", "fallback"])
-@pytest.mark.parametrize("contour", ["factory", "rubrics"])
 async def test_readiness_config_kind_fails_startup_before_any_task(
     recorder: LoopRecorder,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     llm_channels: tuple[FakeLlmServer, FakeLlmServer],
-    contour: str,
     channel: str,
 ) -> None:
     _base_env(monkeypatch, tmp_path)
-    monkeypatch.setenv("RUBRICS_ENABLED", "true" if contour == "rubrics" else "false")
-    monkeypatch.setenv("FACTORY_ENABLED", "true" if contour == "factory" else "false")
     primary, fallback = llm_channels
     (primary if channel == "primary" else fallback).status = 401
 
@@ -357,19 +250,15 @@ async def test_readiness_config_kind_fails_startup_before_any_task(
 
 
 @pytest.mark.parametrize("channel", ["primary", "fallback"])
-@pytest.mark.parametrize("contour", ["factory", "rubrics"])
 async def test_readiness_infra_kind_warns_and_startup_continues(
     recorder: LoopRecorder,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     llm_channels: tuple[FakeLlmServer, FakeLlmServer],
     caplog: pytest.LogCaptureFixture,
-    contour: str,
     channel: str,
 ) -> None:
     _base_env(monkeypatch, tmp_path)
-    monkeypatch.setenv("RUBRICS_ENABLED", "true" if contour == "rubrics" else "false")
-    monkeypatch.setenv("FACTORY_ENABLED", "true" if contour == "factory" else "false")
     primary, fallback = llm_channels
     (primary if channel == "primary" else fallback).status = 500
 
@@ -384,12 +273,11 @@ async def test_readiness_infra_kind_warns_and_startup_continues(
     ]
     assert len(warnings) == 1
     assert f"channel={channel}" in warnings[0].getMessage()
-    expected_loops = (
-        {"slot_scheduler_loop", "daily_summary_loop", "daily_backup_loop"}
-        if contour == "rubrics"
-        else {"scheduler_loop", "factory_scheduler_loop"}
-    )
-    assert set(recorder.started) == expected_loops
+    assert set(recorder.started) == {
+        "slot_scheduler_loop",
+        "daily_summary_loop",
+        "daily_backup_loop",
+    }
 
 
 def server_base(server: FakeLlmServer) -> str:

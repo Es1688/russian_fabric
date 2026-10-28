@@ -1,7 +1,19 @@
 from __future__ import annotations
 
-from max_news_bot.writers.base import WriteResult, Writer
-from max_news_bot.writers.llm import LlmWriter
+from max_news_bot.writers.completion import (
+    CompletionResult,
+    LlmCompletion,
+    LlmCompletionClient,
+    LlmCompletionError,
+)
+from max_news_bot.writers.fallback import FallbackCompletion
 from max_news_bot.writers.validator import validate_post_text
 
-__all__ = ["LlmWriter", "WriteResult", "Writer", "validate_post_text"]
+__all__ = [
+    "CompletionResult",
+    "FallbackCompletion",
+    "LlmCompletion",
+    "LlmCompletionClient",
+    "LlmCompletionError",
+    "validate_post_text",
+]

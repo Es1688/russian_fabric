@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from max_news_bot.config.loader import SourceConfig
+from max_news_bot.parsers.base import SourceConfig
 from max_news_bot.parsers.rss import RssFetcher, _entry_to_item
 
 

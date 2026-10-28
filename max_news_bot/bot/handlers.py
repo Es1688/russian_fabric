@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-import asyncio
 import html
 from datetime import datetime, timezone
 
 from max_news_bot.bot.rubrics_admin import RubricsAdmin
 from max_news_bot.config.loader import AppConfig
-from max_news_bot.core.factory import ContentFactory, FactoryResult
-from max_news_bot.core.pipeline import Pipeline
 from max_news_bot.max_api.client import MaxClient
 from max_news_bot.utils.db import Database
 from max_news_bot.utils.logging import get_logger
@@ -15,21 +12,17 @@ from max_news_bot.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-_RETRACT_LOOKUP_LIMIT = 200
-_RECENT_POSTS_LIMIT = 10
-_LINE_TAIL_LIMIT = 80
 _MAX_ERROR_LEN = 300
 _USER_ERROR_TEXT = "Internal error occurred. Check /status later for details."
-_RUBRICS_DISABLED_TEXT = "Rubrics contour is disabled (check RUBRICS_ENABLED)."
-_FACTORY_PAUSED_TEXT = "Factory paused. Use /factory resume to continue."
 
 # /start doubles as the admin opt-in: MAX forbids a bot from DMing a user
 # until that user has started it (see publishers/alerter.py).
 _START_TEXT = (
-    "Привет! Это бот, который собирает новости и публикует их в канал.\n"
-    "Если вы админ — теперь бот может писать вам в личные сообщения "
+    "Привет! Это бот автономного канала: он ведёт суточную сетку рубрик "
+    "и публикует посты в канал.\n"
+    "Если вы админ — бот может писать вам в личные сообщения "
     "(превью dry-run и алерты приходят сюда).\n"
-    "Команды: /status, /sources, /stats, /news, /factory, /posts."
+    "Команды: /status, /stats, /factory."
 )
 
 # Registered via PATCH /me/commands at startup (best-effort).
@@ -37,32 +30,25 @@ BOT_COMMANDS: list[dict] = [
     {"name": "start", "description": "Приветствие и подписка на личные сообщения"},
     {"name": "chatid", "description": "Показать chat_id чата и user_id отправителя"},
     {"name": "status", "description": "Состояние бота"},
-    {"name": "sources", "description": "Список RSS-источников"},
     {"name": "stats", "description": "Статистика по дням"},
-    {"name": "news", "description": "Запустить сбор новостей (админ)"},
-    {"name": "factory", "description": "Фабрика/рубрики: pause, run, resume, status, retract (админ)"},
-    {"name": "posts", "description": "Последние посты (админ)"},
+    {"name": "factory", "description": "Рубрики: pause, run, resume, status, retract (админ)"},
 ]
 
 
 def create_dispatcher(
     config: AppConfig,
-    pipeline: Pipeline,
     db: Database,
-    publish_lock: asyncio.Lock,
     started_at: datetime,
     *,
-    factory: ContentFactory | None = None,
-    factory_lock: asyncio.Lock | None = None,
     client: MaxClient | None = None,
-    rubrics_admin: RubricsAdmin | None = None,
+    rubrics_admin: RubricsAdmin,
 ):
     """Wire all command handlers into one ``handle_update(update: dict)``.
 
     Plain MAX update dicts in, replies out via MaxClient.send_message —
     no framework, so tests call the returned coroutine directly.
-    ``rubrics_admin`` attaches the rubrics contour levers (plan section 11);
-    without it every /factory form keeps its legacy semantics.
+    ``rubrics_admin`` carries the contour levers (plan section 11): the
+    rubrics contour is the only publishing contour of the process.
     """
     # MAX sends every message with a format; replies go as html, so any
     # dynamic value (names, titles, errors) is escaped at embed time.
@@ -95,30 +81,17 @@ def create_dispatcher(
 
         if command == "status":
             uptime = datetime.now(timezone.utc) - started_at
-            last_run = await db.get_last_event("run")
+            last_heartbeat = await db.get_last_event("slot_heartbeat")
             last_error = await db.get_last_event("error")
             await reply(
                 chat_id,
                 "\n".join(
                     [
                         f"Uptime: {format_timedelta(uptime)}",
-                        f"Last run: {format_event(last_run)}",
+                        f"Last scheduler heartbeat: {format_event(last_heartbeat)}",
                         f"Last error: {format_event(last_error)}",
                     ]
                 ),
-            )
-            return
-
-        if command == "sources":
-            lines = []
-            for source in config.sources:
-                status = "enabled" if source.enabled else "disabled"
-                category = (
-                    f" ({html.escape(source.category)})" if source.category else ""
-                )
-                lines.append(f"- {html.escape(source.name)}{category}: {status}")
-            await reply(
-                chat_id, "\n".join(lines) if lines else "No sources configured."
             )
             return
 
@@ -136,26 +109,6 @@ def create_dispatcher(
             await reply(chat_id, "\n".join(lines))
             return
 
-        if command == "news":
-            if not is_admin(user_id):
-                logger.info(
-                    "access_denied chat_id=%s user_id=%s command=%s",
-                    chat_id,
-                    user_id,
-                    command,
-                )
-                await reply(chat_id, "Access denied.")
-                return
-            async with publish_lock:
-                await reply(chat_id, "Running pipeline...")
-                result = await pipeline.run()
-            await reply(
-                chat_id,
-                f"Pipeline done: collected={result.collected} "
-                f"published={result.published}",
-            )
-            return
-
         if command == "factory":
             if not is_admin(user_id):
                 logger.info(
@@ -169,37 +122,10 @@ def create_dispatcher(
             await dispatch_factory(chat_id, args)
             return
 
-        if command == "posts":
-            if not is_admin(user_id):
-                logger.info(
-                    "access_denied chat_id=%s user_id=%s command=%s",
-                    chat_id,
-                    user_id,
-                    command,
-                )
-                await reply(chat_id, "Access denied.")
-                return
-            posts = await db.get_recent_posts(_RECENT_POSTS_LIMIT)
-            if not posts:
-                await reply(chat_id, "No posts yet.")
-                return
-            lines = ["Recent posts:"]
-            for post in posts:
-                tail = post.error or post.title or ""
-                tail = " ".join(tail.split())
-                lines.append(
-                    f"#{post.id} [{html.escape(post.status)}] "
-                    f"attempts={post.attempts} "
-                    f"{html.escape(post.source)}: "
-                    f"{html.escape(tail[:_LINE_TAIL_LIMIT])}"
-                )
-            await reply(chat_id, "\n".join(lines))
-            return
-
         # unknown command: silent, mirroring the aiogram router fallthrough
 
     async def dispatch_factory(chat_id: int, args: list[str]) -> None:
-        action = args[0].lower() if args else "run"
+        action = args[0].lower() if args else "status"
         scope = args[1].lower() if len(args) > 1 else None
 
         def admin_reply(text: str):
@@ -209,96 +135,45 @@ def create_dispatcher(
             if scope is not None:
                 # /factory run <rubric>: manual today's slot of the rubric,
                 # guarded by the same daily_cap/UNIQUE rules (plan section 2)
-                if rubrics_admin is None:
-                    await reply(chat_id, _RUBRICS_DISABLED_TEXT)
-                    return
                 await rubrics_admin.run_rubric(scope, admin_reply)
                 return
-            if factory is None or factory_lock is None:
-                if rubrics_admin is not None:
-                    # rubrics contour: bare run = one immediate scheduler tick
-                    await rubrics_admin.run_tick(admin_reply)
-                    return
-                await reply(
-                    chat_id,
-                    "Factory is disabled "
-                    "(check FACTORY_ENABLED / factory.enabled).",
-                )
-                return
-            async with factory_lock:
-                await reply(chat_id, "Running factory cycle...")
-                result = await factory.run()
-            await reply(chat_id, format_factory_result(result))
+            # bare run = one immediate scheduler tick
+            await rubrics_admin.run_tick(admin_reply)
             return
 
         if action == "pause":
-            if scope is not None:
-                # /factory pause all|<rubric>: rubric_state pause (plan section 11)
-                if rubrics_admin is None:
-                    await reply(chat_id, _RUBRICS_DISABLED_TEXT)
-                    return
-                await reply(chat_id, await rubrics_admin.pause(scope))
-                return
-            # legacy global pause, unchanged; with the rubrics contour on the
-            # same lever additionally stops every rubric (one lever = full stop)
-            await db.set_state_flag("factory", False)
-            await db.log_event("factory_pause", "manual")
-            text = _FACTORY_PAUSED_TEXT
-            if rubrics_admin is not None:
-                text += "\n" + await rubrics_admin.pause("all")
-            await reply(chat_id, text)
+            # /factory pause [all|<rubric>]: rubric_state pause (plan section 11)
+            await reply(chat_id, await rubrics_admin.pause(scope or "all"))
             return
 
         if action == "resume":
-            if scope is not None:
-                # /factory resume all|<rubric>: clear the rubric_state pause
-                if rubrics_admin is None:
-                    await reply(chat_id, _RUBRICS_DISABLED_TEXT)
-                    return
-                await reply(chat_id, await rubrics_admin.resume(scope))
-                return
-            await db.set_state_flag("factory", True)
-            await db.set_state_flag("factory_autopause", True)
-            await db.log_event("factory_resume", "manual")
-            text = "Factory resumed (manual pause and auto-pause cleared)."
-            if rubrics_admin is not None:
-                text += "\n" + await rubrics_admin.resume("all")
-            await reply(chat_id, text)
+            # /factory resume [all|<rubric>]: clear the rubric_state pause
+            await reply(chat_id, await rubrics_admin.resume(scope or "all"))
             return
 
         if action == "status":
-            text = await factory_status(config, db)
-            if rubrics_admin is not None:
-                text += "\n\n" + await rubrics_admin.status_text()
-            await reply(chat_id, text)
+            await reply(chat_id, await rubrics_admin.status_text())
             return
 
         if action == "retract":
-            if scope == "slot":
-                # /factory retract slot <run_id>: unknown-delivery duplicate
-                # lever of the rubrics contour (plan section 10)
-                if rubrics_admin is None:
-                    await reply(chat_id, _RUBRICS_DISABLED_TEXT)
-                    return
-                if len(args) < 3 or not args[2].isdigit():
-                    await reply(
-                        chat_id,
-                        "Usage: /factory retract slot &lt;run_id&gt;",
-                    )
-                    return
+            # /factory retract slot <run_id>: unknown-delivery duplicate
+            # lever of the contour (plan section 10)
+            if scope != "slot" or len(args) < 3 or not args[2].isdigit():
                 await reply(
                     chat_id,
-                    await rubrics_admin.retract_slot(client, int(args[2])),
+                    "Usage: /factory retract slot &lt;run_id&gt;",
                 )
                 return
-            await retract_post(client, chat_id, args, config, db)
+            await reply(
+                chat_id,
+                await rubrics_admin.retract_slot(client, int(args[2])),
+            )
             return
 
         # replies are html: literal angle brackets must be escaped
         await reply(
             chat_id,
             "Usage: /factory [run|pause|resume|status] [all|&lt;rubric&gt;] | "
-            "/factory retract &lt;post_id&gt; | "
             "/factory retract slot &lt;run_id&gt;",
         )
 
@@ -398,8 +273,8 @@ def _parse_update(
 
 
 def _split_command(text: str | None) -> tuple[str, list[str]]:
-    """"/factory retract 5" -> ("factory", ["retract", "5"]); plain text or
-    empty input -> ("", [])."""
+    """"/factory retract slot 5" -> ("factory", ["retract", "slot", "5"]); plain
+    text or empty input -> ("", [])."""
     if not isinstance(text, str):
         return "", []
     parts = text.split()
@@ -412,89 +287,6 @@ def _int_or_none(value: object) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value
-
-
-async def factory_status(config: AppConfig, db: Database) -> str:
-    paused = not await db.get_state_flag("factory")
-    autopaused = not await db.get_state_flag("factory_autopause")
-    last_run = await db.get_last_event("factory_run")
-    lines = [
-        f"Factory: {'enabled' if config.factory.enabled else 'disabled'} (config)",
-        f"Dry-run: {'on' if config.factory.dry_run else 'off'}",
-        f"Interval: {config.factory.interval_hours}h",
-        f"Paused (manual): {'yes' if paused else 'no'}",
-        f"Auto-paused: {'yes' if autopaused else 'no'}",
-        f"Last cycle: {format_event(last_run)}",
-    ]
-    if autopaused:
-        last_alert = await db.get_last_event("factory_alert")
-        reason = (last_alert or {}).get("details") or "unknown"
-        lines.append(f"Autopause reason: {html.escape(_short(reason))}")
-    return "\n".join(lines)
-
-
-async def retract_post(
-    client: MaxClient | None,
-    chat_id: int,
-    args: list[str],
-    config: AppConfig,
-    db: Database,
-) -> None:
-    if len(args) < 2 or not args[1].isdigit():
-        await _reply(client, chat_id, "Usage: /factory retract <post_id>")
-        return
-    post_id = int(args[1])
-
-    posts = await db.get_recent_posts(_RETRACT_LOOKUP_LIMIT)
-    post = next((p for p in posts if p.id == post_id), None)
-    if post is None:
-        await _reply(client, chat_id, f"Post {post_id} not found.")
-        return
-    if post.message_id is None or post.status == "previewed":
-        await _reply(
-            client,
-            chat_id,
-            "Cannot retract: the post has no channel message "
-            "(dry-run previews go to the admins, not to the channel).",
-        )
-        return
-    if client is None:
-        await _reply(
-            client, chat_id, "Retract is unavailable (bot instance missing)."
-        )
-        return
-
-    try:
-        # MaxClient.delete_message takes only the message id — the token
-        # already scopes it to the bot's own messages
-        await client.delete_message(post.message_id)
-    except Exception as exc:
-        error = f"{type(exc).__name__}: {exc}"[:_MAX_ERROR_LEN]
-        logger.error("factory_retract_failed id=%s error=%s", post_id, error)
-        await _reply(client, chat_id, f"Retract failed: {error}")
-        return
-    await db.log_event("factory_retract", f"id={post_id}")
-    await _reply(
-        client, chat_id, f"Post {post_id} retracted from the channel."
-    )
-
-
-async def _reply(client: MaxClient | None, chat_id: int, text: str) -> None:
-    if client is None:
-        logger.warning("reply_skipped chat_id=%s (no client)", chat_id)
-        return
-    await client.send_message(chat_id, text, fmt="html")
-
-
-def format_factory_result(result: FactoryResult) -> str:
-    return (
-        "Factory cycle done: "
-        f"collected={result.collected} filtered={result.filtered} "
-        f"deduped={result.deduped} written={result.written} "
-        f"skipped={result.skipped} published={result.published} "
-        f"previewed={result.previewed} failed={result.failed} "
-        f"recovered={result.recovered}"
-    )
 
 
 def format_event(event: dict | None) -> str:

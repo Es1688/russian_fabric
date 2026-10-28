@@ -6,6 +6,8 @@ import pytest
 
 from max_news_bot.config.loader import load_config
 
+_PACKAGE = Path(__file__).resolve().parents[1]
+
 
 def test_no_heavy_dependencies_in_pyproject() -> None:
     pyproject = (
@@ -16,36 +18,30 @@ def test_no_heavy_dependencies_in_pyproject() -> None:
         assert package not in pyproject
 
 
-def test_pipeline_has_no_telegram_imports() -> None:
-    pipeline_source = (
-        Path(__file__).resolve().parents[1] / "core" / "pipeline.py"
-    ).read_text(encoding="utf-8")
-    assert "aiogram" not in pipeline_source
-    assert "TelegramPublisher" not in pipeline_source
+def test_package_has_no_telegram_imports() -> None:
+    # the port must stay MAX-native: no aiogram/Telegram leftovers anywhere
+    # in the production code (this test module itself mentions them)
+    for source in _PACKAGE.rglob("*.py"):
+        if "tests" in source.relative_to(_PACKAGE).parts:
+            continue
+        text = source.read_text(encoding="utf-8")
+        assert "import aiogram" not in text, source
+        assert "from aiogram" not in text, source
+        assert "TelegramPublisher" not in text, source
+        assert "TelegramAlerter" not in text, source
 
 
-def test_factory_has_no_telegram_imports() -> None:
-    factory_source = (
-        Path(__file__).resolve().parents[1] / "core" / "factory.py"
-    ).read_text(encoding="utf-8")
-    assert "aiogram" not in factory_source
-    assert "TelegramPublisher" not in factory_source
-    assert "TelegramAlerter" not in factory_source
-
-
-def test_models_define_news_item_and_publisher_result() -> None:
-    from max_news_bot.core.models import NewsItem, PublishedResult
-    from max_news_bot.publishers.base import Publisher
+def test_models_define_news_item() -> None:
+    from max_news_bot.core.models import NewsItem
 
     item = NewsItem(title="t", url="https://example.com", source="s")
     assert item.title == "t"
-    assert hasattr(Publisher, "publish") or "publish" in Publisher.__dict__
-    result = PublishedResult(success=True, published=1)
-    assert result.success is True
 
 
 def test_missing_bot_token_fail_fast_on_startup(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("MAX_BOT_TOKEN", raising=False)
+    # hermetic: a developer's real max_news_bot/.env (e.g. RUBRICS_DRY_RUN)
+    # would otherwise leak into os.environ for the whole pytest session
+    monkeypatch.setattr("max_news_bot.config.loader.load_dotenv", lambda: None)
     monkeypatch.setenv("MAX_BOT_TOKEN", "")
     monkeypatch.setenv("MAX_CHANNEL_ID", "-1001234567890")
 

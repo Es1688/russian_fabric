@@ -65,8 +65,8 @@ from max_news_bot.writers.completion import (
     CompletionResult,
     LlmCompletion,
     LlmCompletionError,
+    SKIP_MARKER,
 )
-from max_news_bot.writers.llm import SKIP_MARKER
 from max_news_bot.writers.validator import (
     find_cliche_phrase,
     validate_post_text,

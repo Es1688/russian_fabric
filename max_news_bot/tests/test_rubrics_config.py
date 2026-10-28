@@ -30,11 +30,19 @@ def _write_config(tmp_path: Path, content: str) -> Path:
 
 @pytest.fixture
 def rubrics_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    # load_rubrics_config never calls load_dotenv; only its own env flags
+    # load_rubrics_config never calls load_dotenv; only its own env flags.
+    # The shipped grid has LLM rubrics, so both channel keys are set for the
+    # default tests; tests of the fail-fast rules delete them explicitly.
     monkeypatch.delenv("RUBRICS_ENABLED", raising=False)
     monkeypatch.delenv("RUBRICS_CONFIG_PATH", raising=False)
     monkeypatch.delenv("RUBRICS_DRY_RUN", raising=False)
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+    monkeypatch.delenv("LLM_FALLBACK_BASE_URL", raising=False)
+    monkeypatch.delenv("LLM_FALLBACK_MODEL", raising=False)
     monkeypatch.setenv("MAX_CHANNEL_ID", "-1001234567890")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+    monkeypatch.setenv("LLM_API_KEY", "test-llm-key")
 
 
 def _load_with(tmp_path: Path, content: str) -> None:
@@ -47,10 +55,18 @@ def _load_with(tmp_path: Path, content: str) -> None:
 def test_shipped_config_loads(rubrics_env: None) -> None:
     config = load_rubrics_config()
 
-    assert config.enabled is False  # contour off until RUBRICS_ENABLED=true
     assert config.timezone == "Europe/Moscow"
     assert "старшего возраста" in config.persona
     assert "тёплые цвета" in config.image_style
+    # LLM channels moved here from the removed sources.yaml: one contour -
+    # one config file; the keys themselves stay env-only
+    assert config.llm.primary.base_url == "https://openrouter.ai/api/v1"
+    assert config.llm.primary.model == "qwen/qwen3.8-flash"
+    assert config.llm.primary.api_key == "test-openrouter-key"
+    assert config.llm.primary.disable_reasoning is True
+    assert config.llm.fallback is not None
+    assert config.llm.fallback.base_url == "https://ai.api.cloud.yandex.net/v1"
+    assert config.llm.fallback.api_key == "test-llm-key"
     # image generation section (dual-channel plan section 3): fal is the
     # active provider, yandex_art is reserved as a stub
     assert config.image_generation.fal.model == "fal-ai/flux/dev"
@@ -166,20 +182,6 @@ def test_shipped_enabled_grid_fits_daily_cap(rubrics_env: None) -> None:
     assert per_day["sun"] == ["good_morning", "weather", "good_news", "good_night"]
 
 
-def test_disabled_by_default_without_env(rubrics_env: None) -> None:
-    config = load_rubrics_config()
-
-    assert config.enabled is False
-
-
-def test_enabled_via_env_flag(rubrics_env: None, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("RUBRICS_ENABLED", "true")
-
-    config = load_rubrics_config()
-
-    assert config.enabled is True
-
-
 def test_minimal_config_defaults(rubrics_env: None, tmp_path: Path) -> None:
     config = load_rubrics_config(_write_config(tmp_path, MINIMAL_YAML))
 
@@ -214,20 +216,8 @@ def test_config_path_from_env(rubrics_env: None, tmp_path: Path, monkeypatch: py
     assert config.rubrics[0].id == "stub"
 
 
-def test_missing_file_disabled_is_empty(
-    rubrics_env: None, tmp_path: Path
-) -> None:
-    config = load_rubrics_config(tmp_path / "absent.yaml")
-
-    assert config.enabled is False
-    assert config.rubrics == ()
-
-
-def test_missing_file_enabled_fails(
-    rubrics_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("RUBRICS_ENABLED", "true")
-
+def test_missing_file_fails(rubrics_env: None, tmp_path: Path) -> None:
+    # the contour is the only publishing one: its config file is mandatory
     with pytest.raises(RubricsConfigError, match="rubrics config not found"):
         load_rubrics_config(tmp_path / "absent.yaml")
 
@@ -489,15 +479,22 @@ def test_generate_image_without_fal_key_fails(
 def test_generate_image_disabled_rubric_needs_no_key(
     rubrics_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # a disabled rubric never runs, so it does not bind the deploy env
+    # a disabled rubric never runs, so it does not bind the deploy env;
+    # a plain bank stub stays enabled to satisfy the contour requirement
     monkeypatch.delenv("FAL_KEY", raising=False)
     content = GENERATE_YAML.replace(
         "kind: bank", "enabled: false\n    kind: bank"
-    )
+    ) + '''
+  - id: stub_enabled
+    time: "10:00"
+    kind: bank
+'''
 
     config = load_rubrics_config(_write_config(tmp_path, content))
 
-    assert config.rubrics[0].enabled is False
+    by_id = {rubric.id: rubric for rubric in config.rubrics}
+    assert by_id["stub"].enabled is False
+    assert by_id["stub_enabled"].enabled is True
 
 
 def test_yandex_art_section_alone_needs_no_key(
@@ -551,50 +548,27 @@ def app_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MAX_CHANNEL_ID", "-1001234567890")
     monkeypatch.setenv("ADMIN_IDS", "111,222")
     monkeypatch.setenv("LLM_API_KEY", "test-llm-key")
-    # dual-channel fail-fast in load_config: an active LLM contour requires
-    # both the primary OpenRouter key and the Yandex fallback key
+    # dual-channel fail-fast: LLM rubrics require both the primary
+    # OpenRouter key and the Yandex fallback key
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
-    monkeypatch.delenv("FACTORY_ENABLED", raising=False)
     monkeypatch.delenv("RUBRICS_ENABLED", raising=False)
     monkeypatch.delenv("RUBRICS_CONFIG_PATH", raising=False)
     monkeypatch.delenv("RUBRICS_DRY_RUN", raising=False)
     monkeypatch.delenv("NEWS_SOURCES_PATH", raising=False)
 
 
-def test_load_config_rubrics_default_off(app_env: None) -> None:
+def test_load_config_reads_shipped_rubrics(app_env: None) -> None:
     config = load_config()
 
-    assert config.rubrics.enabled is False
     assert len(config.rubrics.rubrics) == 7  # grid of 6 + the smoke stub
+    assert config.rubrics.llm.primary.api_key == "test-openrouter-key"
 
 
-def test_load_config_rubrics_enabled_with_legacy_off(app_env: None, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("FACTORY_ENABLED", "false")
-    monkeypatch.setenv("RUBRICS_ENABLED", "true")
-
-    config = load_config()
-
-    assert config.rubrics.enabled is True
-    assert config.factory.enabled is False
-
-
-def test_load_config_contour_conflict_fails(
-    app_env: None, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # both publishing contours explicitly on: rubrics scheduler + legacy
-    # factory loop would double-publish; startup must abort with a cause
-    monkeypatch.setenv("FACTORY_ENABLED", "true")
-    monkeypatch.setenv("RUBRICS_ENABLED", "true")
-
-    with pytest.raises(ValueError, match="Conflicting publishing contours"):
-        load_config()
-
-
-def test_load_config_rubrics_typo_fails_even_when_disabled(
+def test_load_config_rubrics_typo_fails(
     app_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # RUBRICS_ENABLED is false, yet the broken yaml aborts the launch: a
-    # typo must fail the restart, not the future 07:00 post (plan section 8)
+    # the broken yaml aborts the launch: a typo must fail the restart,
+    # not the future 07:00 post (plan section 8)
     monkeypatch.setenv(
         "RUBRICS_CONFIG_PATH", str(_write_config(tmp_path, MINIMAL_YAML + "\nimeg_style: x\n"))
     )
@@ -606,8 +580,6 @@ def test_load_config_rubrics_typo_fails_even_when_disabled(
 def test_load_config_rubrics_without_llm_key_fails(
     app_env: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("FACTORY_ENABLED", "false")
-    monkeypatch.setenv("RUBRICS_ENABLED", "true")
     monkeypatch.delenv("LLM_API_KEY", raising=False)
 
     # the shipped grid has generative/digest rubrics -> LLM key is required
@@ -618,14 +590,12 @@ def test_load_config_rubrics_without_llm_key_fails(
 def test_load_config_rubrics_without_enabled_rubrics_fails(
     app_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("FACTORY_ENABLED", "false")
-    monkeypatch.setenv("RUBRICS_ENABLED", "true")
     monkeypatch.setenv(
         "RUBRICS_CONFIG_PATH",
         str(_write_config(tmp_path, MINIMAL_YAML.replace("kind: bank", "kind: bank\n    enabled: false"))),
     )
 
-    with pytest.raises(ValueError, match="no enabled rubrics"):
+    with pytest.raises(ValueError, match="at least one enabled rubric"):
         load_config()
 
 
@@ -634,8 +604,6 @@ def test_load_config_generate_image_without_fal_key_fails(
 ) -> None:
     # startup integration (dual-channel plan section 3.2): an enabled
     # image: generate rubric aborts load_config without FAL_KEY
-    monkeypatch.setenv("FACTORY_ENABLED", "false")
-    monkeypatch.setenv("RUBRICS_ENABLED", "true")
     monkeypatch.delenv("FAL_KEY", raising=False)
     monkeypatch.setenv(
         "RUBRICS_CONFIG_PATH", str(_write_config(tmp_path, GENERATE_YAML))
@@ -655,8 +623,6 @@ def test_dry_run_env_flips_publishing_on(
 ) -> None:
     # rollout switch on the VPS: RUBRICS_DRY_RUN=false turns on channel
     # publishing without touching rubrics.yaml in the repo
-    monkeypatch.setenv("FACTORY_ENABLED", "false")
-    monkeypatch.setenv("RUBRICS_ENABLED", "true")
     monkeypatch.setenv("RUBRICS_DRY_RUN", "false")
 
     config = load_config()
@@ -668,9 +634,7 @@ def test_rubrics_dry_run_without_admin_ids_fails(
     app_env: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # previews are delivered to admins: without them every dry-run post
-    # would fail, so fail fast at startup instead (same rule as the factory)
-    monkeypatch.setenv("FACTORY_ENABLED", "false")
-    monkeypatch.setenv("RUBRICS_ENABLED", "true")
+    # would fail, so fail fast at startup instead
     monkeypatch.delenv("ADMIN_IDS", raising=False)
 
     with pytest.raises(ValueError, match="ADMIN_IDS"):
@@ -680,8 +644,6 @@ def test_rubrics_dry_run_without_admin_ids_fails(
 def test_rubrics_dry_run_off_survives_without_admin_ids(
     app_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("FACTORY_ENABLED", "false")
-    monkeypatch.setenv("RUBRICS_ENABLED", "true")
     monkeypatch.setenv("RUBRICS_DRY_RUN", "false")
     monkeypatch.delenv("ADMIN_IDS", raising=False)
     # bank/weather only: no LLM key requirement either

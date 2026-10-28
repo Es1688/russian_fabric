@@ -35,6 +35,7 @@ from max_news_bot.config.rubrics import (
     TargetConfig,
     load_rubrics_config,
 )
+from max_news_bot.tests.conftest import make_llm_channels
 from max_news_bot.core.models import ContentBankItem, SlotRun
 from max_news_bot.utils.db import Database
 from max_news_bot.utils.repositories import (
@@ -110,7 +111,7 @@ def make_rubric(
 
 def make_config() -> RubricsConfig:
     return RubricsConfig(
-        enabled=True,
+        llm=make_llm_channels(),
         timezone="Europe/Moscow",
         persona=PERSONA,
         image_style="",
@@ -190,6 +191,9 @@ def test_shipped_second_post_block_matches_plan_grid(
     monkeypatch.delenv("RUBRICS_ENABLED", raising=False)
     monkeypatch.delenv("RUBRICS_CONFIG_PATH", raising=False)
     monkeypatch.setenv("MAX_CHANNEL_ID", "-1001234567890")
+    # the shipped grid enables LLM rubrics: both channel keys are required
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+    monkeypatch.setenv("LLM_API_KEY", "test-llm-key")
     config = load_rubrics_config()
 
     rubric = next(r for r in config.rubrics if r.id == "second_post")

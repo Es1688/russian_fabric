@@ -16,7 +16,7 @@ from max_news_bot.bot.daily_summary import (
     DailySummaryService,
     parse_summary_time,
 )
-from max_news_bot.config.rubrics import WEEKDAYS, empty_rubrics_config
+from max_news_bot.config.rubrics import DEFAULT_SUMMARY_TIME, WEEKDAYS
 from max_news_bot.core.models import ContentBankItem
 from max_news_bot.tests.test_slot_scheduler import make_config, make_rubric
 from max_news_bot.utils.db import Database
@@ -370,4 +370,4 @@ def test_parse_summary_time_valid_and_invalid() -> None:
 
 def test_default_summary_time_is_2240() -> None:
     # plan section 11: the fixed summary slot, after the last 21:30 post
-    assert empty_rubrics_config().summary_time == "22:40"
+    assert DEFAULT_SUMMARY_TIME == "22:40"

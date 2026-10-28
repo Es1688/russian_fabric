@@ -87,7 +87,7 @@ class MaxSlotPublisher:
     """Sends rubric posts to MAX with an optional bank postcard."""
 
     # pause between consecutive MAX sends: the rate limit is 2 messages/sec
-    # per dialog; tests shrink it to zero (same as MaxPostPublisher)
+    # per dialog; tests shrink it to zero
     SEND_PAUSE_SECONDS: float = 2.5
     # base pause of the growing attachment.not.ready interval: 1s, 2s, 4s
     ATTACHMENT_PAUSE_SECONDS: float = 1.0

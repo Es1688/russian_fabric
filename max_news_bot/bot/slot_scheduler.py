@@ -1,7 +1,7 @@
 """Slot scheduler for the autonomous channel (plan sections 10 and 11).
 
-The rubrics contour replacement of the interval loops in ``bot/scheduler.py``
-(switched by RUBRICS_ENABLED): the day is a grid of rubric slots, every slot
+The only publishing contour of the process: the day is a grid of rubric
+slots, every slot
 is claimed exactly once through UNIQUE(rubric_id, slot_date), slots that
 became due in the same tick execute strictly in time order, and each run is
 tracked through the ``slot_runs`` lifecycle:
@@ -104,7 +104,7 @@ class GenerationOutcome:
 
 @dataclass(frozen=True)
 class SlotPublishResult:
-    """Result of one slot send (mirrors PostPublishResult semantics)."""
+    """Result of one slot send."""
 
     success: bool
     message_id: str | None = None

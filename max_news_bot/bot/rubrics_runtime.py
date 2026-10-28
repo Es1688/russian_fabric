@@ -1,16 +1,14 @@
-"""Runtime wiring of the rubrics contour (plan sections 8, 14).
+"""Runtime wiring of the rubrics contour — the only publishing contour.
 
-``main.py`` switches the whole process between two publishing contours:
-the legacy interval loops and the rubrics slot scheduler. This module is
-the composition root of the second one - everything ``RUBRICS_ENABLED``
-needs at startup is built here, so ``main.py`` only decides which set of
-background tasks to start:
+``main.py`` starts this composition root unconditionally (the legacy
+digest/factory loops are gone): everything the process needs at startup is
+built here:
 
 - repositories over the shared database file;
 - one pipeline per enabled rubric (dispatched by the router below):
   generative / bank / digest / weather;
 - the image generator behind ``image: generate`` rubrics (dual-channel
-  plan §3.2): fal.ai active iff ``FAL_KEY`` is set, bytes to
+  plan §3.2): fal.ai active iff FAL_KEY is set, bytes to
   ``data/generated`` (dual-channel plan §3.3);
 - the slot scheduler with the slot publisher, alerter and the contour's
   dry-run flag (``RUBRICS_DRY_RUN``, previews to admins);
@@ -22,7 +20,7 @@ wired LLM channels (dual-channel plan §2.1) — a config-kind failure
 (broken key/balance/model) fails the launch, an infra-kind one (timeout,
 network, 5xx) only logs a warning and the startup continues. Everything
 else stays offline; config validation has already failed fast on a broken
-yaml, a contour conflict or a missing LLM key.
+yaml or a missing LLM key.
 """
 
 from __future__ import annotations
@@ -154,10 +152,11 @@ async def _build_completion(
     alerter: MaxAlerter,
 ) -> LlmCompletion | None:
     """Primary completion client wrapped into the per-request failover
+
     when the fallback channel is configured (dual-channel plan §2.3);
     both wired channels are readiness-probed here (§2.1) — the single
     network call of the contour's construction, before the first slot."""
-    llm = config.factory.llm
+    llm = config.rubrics.llm.primary
     if not llm.api_key:
         return None
     primary = LlmCompletionClient(
@@ -170,7 +169,7 @@ async def _build_completion(
         disable_reasoning=llm.disable_reasoning,
         session=http_session,
     )
-    fallback_llm = config.factory.llm_fallback
+    fallback_llm = config.rubrics.llm.fallback
     fallback = (
         None
         if fallback_llm is None
@@ -187,7 +186,7 @@ async def _build_completion(
             session=http_session,
         )
     )
-    await probe_llm_channels(config.factory, http_session)
+    await probe_llm_channels(config.rubrics.llm, http_session)
     if fallback is None:
         # a single channel is valid only outside LLM contours
         return primary
@@ -246,7 +245,7 @@ async def build_rubrics_runtime(
     if needs_llm and completion is None:
         # Unreachable behind load_config validation; kept honest anyway.
         raise ValueError(
-            "rubrics of LLM kinds require LLM_API_KEY at startup"
+            "rubrics of LLM kinds require the LLM channel keys at startup"
         )
 
     router = RubricPipelineRouter()

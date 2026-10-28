@@ -24,6 +24,7 @@ from max_news_bot.config.rubrics import (
     TargetConfig,
     WEEKDAYS,
 )
+from max_news_bot.tests.conftest import make_llm_channels
 from max_news_bot.core.models import NewsItem
 from max_news_bot.rubrics.digest import (
     ISSUE_TITLE,
@@ -173,7 +174,7 @@ def make_config(
     rubrics: list[RubricConfig], *, persona: str = PERSONA
 ) -> RubricsConfig:
     return RubricsConfig(
-        enabled=True,
+        llm=make_llm_channels(),
         timezone="Europe/Moscow",
         persona=persona,
         image_style="",

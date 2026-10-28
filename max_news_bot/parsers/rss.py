@@ -10,7 +10,7 @@ from typing import Any
 import aiohttp
 import feedparser
 
-from max_news_bot.config.loader import SourceConfig
+from max_news_bot.parsers.base import SourceConfig
 from max_news_bot.core.models import NewsItem
 from max_news_bot.utils.logging import get_logger
 

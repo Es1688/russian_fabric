@@ -1,16 +1,17 @@
-"""Rubrics configuration for the autonomous channel (plan section 8).
+"""Configuration of the single publishing contour (plan section 8).
 
-``rubrics.yaml`` lives next to ``sources.yaml`` and carries the global
-section (timezone, persona, image_style, image_generation, targets,
-daily_cap, weather points) plus one block per rubric. Everything is
-validated here at startup: a typo must abort the launch, not surface as a
-broken 07:00 post.
+``rubrics.yaml`` carries the LLM channels (``llm``/``llm_fallback``,
+moved here from the removed sources.yaml — one contour, one config file),
+the global section (timezone, persona, image_style, image_generation,
+targets, daily_cap, weather points) plus one block per rubric. Everything
+is validated here at startup: a typo must abort the launch, not surface as
+a broken 07:00 post.
 
-The rubrics contour itself is switched by the RUBRICS_ENABLED env flag
-(default false). Mutual exclusivity with the legacy loops (digest scheduler
-and content factory) is enforced in ``config.loader.load_config``. The
-contour's dry-run (previews to admins instead of channel posts) is the
-RUBRICS_DRY_RUN env flag, true by default.
+The rubrics contour is the only publishing contour of the process (the
+legacy digest/factory loops were removed together with RUBRICS_ENABLED /
+FACTORY_ENABLED switches), so the file is mandatory and must define at
+least one enabled rubric. The contour dry-run (previews to admins instead
+of channel posts) is the RUBRICS_DRY_RUN env flag, true by default.
 """
 
 from __future__ import annotations
@@ -67,6 +68,8 @@ _TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 
 _TOP_LEVEL_KEYS = (
     "timezone",
+    "llm",
+    "llm_fallback",
     "persona",
     "image_style",
     "image_generation",
@@ -119,6 +122,40 @@ class WeatherPoint:
 class TargetConfig:
     name: str
     channel_id: int  # MAX chat_id is int64
+
+
+@dataclass(frozen=True)
+class LlmConfig:
+    """One OpenAI-compatible LLM channel; the key is env-only, never yaml."""
+
+    base_url: str
+    model: str
+    timeout: int
+    max_tokens: int
+    temperature: float
+    api_key: str  # env-only secret, never in yaml
+    # thinking models otherwise burn the whole max_tokens on reasoning
+    disable_reasoning: bool = False
+
+
+@dataclass(frozen=True)
+class LlmChannelsConfig:
+    """The per-request failover pair: primary OpenRouter + fallback Yandex."""
+
+    primary: LlmConfig
+    # None unless LLM_API_KEY is set; an LLM contour requires both keys
+    fallback: LlmConfig | None = None
+
+    def missing_keys(self) -> list[str]:
+        """Env names of the absent channel keys (primary and/or fallback)."""
+        return [
+            name
+            for name, value in (
+                ("OPENROUTER_API_KEY", self.primary.api_key),
+                ("LLM_API_KEY", self.fallback.api_key if self.fallback else ""),
+            )
+            if not value
+        ]
 
 
 @dataclass(frozen=True)
@@ -179,7 +216,6 @@ class RubricConfig:
 
 @dataclass(frozen=True)
 class RubricsConfig:
-    enabled: bool
     timezone: str
     persona: str
     image_style: str
@@ -187,6 +223,9 @@ class RubricsConfig:
     daily_cap: int
     weather_points: tuple[WeatherPoint, ...]
     rubrics: tuple[RubricConfig, ...]
+    # LLM channels of the contour (llm/llm_fallback sections); keys are
+    # env-only, mandatory when rubrics of LLM kinds are enabled.
+    llm: LlmChannelsConfig
     summary_time: str = DEFAULT_SUMMARY_TIME  # "HH:MM" local, plan section 11
     # Image generation providers (dual-channel plan section 3); the default
     # applies when rubrics.yaml omits the section.
@@ -198,21 +237,6 @@ class RubricsConfig:
     dry_run: bool = True
 
 
-def empty_rubrics_config() -> RubricsConfig:
-    """Contour-off placeholder: no file, no rubrics, nothing resolved."""
-    return RubricsConfig(
-        enabled=False,
-        timezone="Europe/Moscow",
-        persona="",
-        image_style="",
-        targets={},
-        daily_cap=6,
-        weather_points=(),
-        rubrics=(),
-        dry_run=False,
-    )
-
-
 # Local twin of loader._env_bool: importing it from loader would create a
 # cycle (loader imports this module to build AppConfig.rubrics).
 def _env_flag(name: str, default: bool) -> bool:
@@ -220,6 +244,71 @@ def _env_flag(name: str, default: bool) -> bool:
     if value is None or value.strip() == "":
         return default
     return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_str(name: str, default: str) -> str:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return default
+    return value.strip()
+
+
+def _parse_llm_channels(raw: Mapping[str, Any]) -> LlmChannelsConfig:
+    """llm/llm_fallback sections with env-only keys and overrides.
+
+    Keys: OPENROUTER_API_KEY (primary), LLM_API_KEY (fallback). The fallback
+    exists iff its key is configured; an LLM contour still requires both
+    (checked against the enabled rubrics after parsing). Overrides without
+    editing the file: LLM_BASE_URL, LLM_MODEL, LLM_FALLBACK_BASE_URL,
+    LLM_FALLBACK_MODEL. timeout/max_tokens/temperature are shared.
+    """
+    llm_raw = raw.get("llm", {}) or {}
+    fallback_raw = raw.get("llm_fallback", {}) or {}
+    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    fallback_api_key = os.getenv("LLM_API_KEY", "").strip()
+
+    timeout = int(llm_raw.get("timeout", 60))
+    max_tokens = int(llm_raw.get("max_tokens", 800))
+    temperature = float(llm_raw.get("temperature", 0.7))
+
+    primary = LlmConfig(
+        base_url=_env_str(
+            "LLM_BASE_URL",
+            str(llm_raw.get("base_url", "https://openrouter.ai/api/v1")),
+        ),
+        model=_env_str(
+            "LLM_MODEL", str(llm_raw.get("model", "qwen/qwen3.8-flash"))
+        ),
+        timeout=timeout,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        api_key=api_key,
+        disable_reasoning=bool(llm_raw.get("disable_reasoning", True)),
+    )
+    fallback = None
+    if fallback_api_key:
+        fallback = LlmConfig(
+            # Yandex AI Studio OpenAI-compatible endpoint; models are full
+            # URIs gpt://<folder_id>/<model>.
+            base_url=_env_str(
+                "LLM_FALLBACK_BASE_URL",
+                str(
+                    fallback_raw.get(
+                        "base_url", "https://ai.api.cloud.yandex.net/v1"
+                    )
+                ),
+            ),
+            model=_env_str(
+                "LLM_FALLBACK_MODEL",
+                str(fallback_raw.get("model", "gpt://FOLDER_ID/yandexgpt-5-lite")),
+            ),
+            timeout=timeout,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            api_key=fallback_api_key,
+            disable_reasoning=bool(fallback_raw.get("disable_reasoning", False)),
+        )
+    return LlmChannelsConfig(primary=primary, fallback=fallback)
 
 
 def _reject_unknown_keys(
@@ -606,7 +695,7 @@ def _parse_rubric(
 
 
 def _parse_rubrics_config(
-    raw: Any, *, enabled: bool, source_path: Path
+    raw: Any, *, source_path: Path
 ) -> RubricsConfig:
     if not isinstance(raw, Mapping):
         raise RubricsConfigError(
@@ -615,6 +704,7 @@ def _parse_rubrics_config(
     _reject_unknown_keys(raw, _TOP_LEVEL_KEYS, str(source_path))
 
     timezone = _parse_timezone(raw.get("timezone", "Europe/Moscow"))
+    llm = _parse_llm_channels(raw)
 
     persona_raw = raw.get("persona")
     persona = _as_str(persona_raw, "persona") if persona_raw is not None else ""
@@ -656,6 +746,26 @@ def _parse_rubrics_config(
     if duplicates:
         raise RubricsConfigError(f"rubrics: duplicate ids {duplicates}")
 
+    # The rubrics contour is the only publishing contour: no enabled rubric
+    # means the process would have nothing to publish at all.
+    enabled_rubrics = [rubric for rubric in rubrics if rubric.enabled]
+    if not enabled_rubrics:
+        raise RubricsConfigError(
+            "rubrics.yaml must define at least one enabled rubric: the "
+            "rubrics contour is the only publishing contour of the process"
+        )
+
+    # LLM rubrics need both channel keys at startup: a single channel
+    # defeats the declared per-request failover.
+    if any(rubric.kind in LLM_KINDS for rubric in enabled_rubrics):
+        missing = llm.missing_keys()
+        if missing:
+            raise RubricsConfigError(
+                f"{' and '.join(missing)} required when rubrics of LLM "
+                f"kinds ({', '.join(LLM_KINDS)}) are enabled: both LLM "
+                "keys must be set (primary OpenRouter, fallback Yandex)"
+            )
+
     # Weather rubrics render the global points; without points the slot
     # could never run (plan section 4).
     if any(r.kind == "weather" and r.enabled for r in rubrics) and not weather_points:
@@ -677,7 +787,6 @@ def _parse_rubrics_config(
         )
 
     return RubricsConfig(
-        enabled=enabled,
         timezone=timezone,
         persona=persona,
         image_style=image_style,
@@ -685,25 +794,21 @@ def _parse_rubrics_config(
         daily_cap=daily_cap,
         weather_points=weather_points,
         rubrics=rubrics,
+        llm=llm,
         summary_time=summary_time,
         image_generation=image_generation,
-        # Deploy-level roll-out switch, same shape as FACTORY_DRY_RUN:
+        # Deploy-level roll-out switch, same shape as the contour's previews:
         # previews to admins by default, publishing only when turned off.
         dry_run=_env_flag("RUBRICS_DRY_RUN", True),
     )
 
 
-def load_rubrics_config(
-    path: Path | None = None, *, enabled: bool | None = None
-) -> RubricsConfig:
-    """Load and validate rubrics.yaml.
+def load_rubrics_config(path: Path | None = None) -> RubricsConfig:
+    """Load and validate rubrics.yaml — the single contour's config file.
 
-    The file is validated even while the contour is off (RUBRICS_ENABLED is
-    false by default), so a typo surfaces on the deploy restart instead of
-    at the 07:00 cutover post.
+    The file is mandatory (the process has no other publishing contour);
+    a missing file, a broken yaml or a failed validation aborts the launch.
     """
-    if enabled is None:
-        enabled = _env_flag("RUBRICS_ENABLED", False)
     env_path = os.getenv("RUBRICS_CONFIG_PATH", "").strip()
     if path is not None:
         config_path = path
@@ -713,12 +818,10 @@ def load_rubrics_config(
         config_path = Path(__file__).resolve().parent / "rubrics.yaml"
 
     if not config_path.exists():
-        if enabled:
-            raise RubricsConfigError(f"rubrics config not found: {config_path}")
-        return empty_rubrics_config()
+        raise RubricsConfigError(f"rubrics config not found: {config_path}")
 
     try:
         raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     except yaml.YAMLError as exc:
         raise RubricsConfigError(f"{config_path}: invalid yaml: {exc}") from exc
-    return _parse_rubrics_config(raw, enabled=enabled, source_path=config_path)
+    return _parse_rubrics_config(raw, source_path=config_path)
