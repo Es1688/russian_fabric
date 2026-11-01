@@ -53,6 +53,9 @@ def test_llm_env_overrides(
     monkeypatch.setenv("LLM_MODEL", "custom-model")
     monkeypatch.setenv("LLM_FALLBACK_BASE_URL", "http://localhost:9090/v1")
     monkeypatch.setenv("LLM_FALLBACK_MODEL", "fallback-model")
+    # the shipped grid has image: generate rubrics; the override above drops
+    # the folder_id, so an image provider must come from FAL_KEY
+    monkeypatch.setenv("FAL_KEY", "test-fal-key")
 
     config = load_config()
 

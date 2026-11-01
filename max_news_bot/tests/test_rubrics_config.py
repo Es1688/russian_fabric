@@ -96,7 +96,11 @@ def test_shipped_config_loads(rubrics_env: None) -> None:
     assert by_id["good_morning"].time == "07:00"
     assert by_id["good_morning"].kind == "bank"
     assert by_id["good_morning"].grace_minutes == 60
-    assert by_id["good_morning"].image == "postcard"
+    # morning, topic and night posts ship a generated image (fal/YandexART);
+    # the bank postcard file is no longer used as the picture
+    assert by_id["good_morning"].image == "generate"
+    assert by_id["topic_day"].image == "generate"
+    assert by_id["good_night"].image == "generate"
     assert by_id["weather"].time == "07:05"
     assert by_id["weather"].kind == "weather"
     assert by_id["weather"].grace_minutes == 30
