@@ -30,8 +30,8 @@ async def main() -> None:
     await db.initialize()
 
     # One shared direct ClientSession per process: the MAX client, RSS
-    # fetching, weather and the Yandex fallback channel; closed in the
-    # finally block below.
+    # fetching, weather and the Yandex fallback channel; both sessions are
+    # closed by the outermost finally, on startup and runtime exits alike.
     http_session = aiohttp.ClientSession()
 
     # Foreign endpoints (OpenRouter, fal.ai) egress through the host-local
@@ -44,63 +44,75 @@ async def main() -> None:
         else None
     )
 
-    client = MaxClient(config.bot_token, session=http_session)
-    fetcher = CompositeFetcher(session=http_session)
-
-    started_at = datetime.now(timezone.utc)
-
-    # The rubrics contour is the only publishing contour: its construction
-    # probes the wired LLM channels (the single network call) and wires the
-    # pipelines, the slot scheduler and the admin levers.
-    runtime = await build_rubrics_runtime(
-        config, db, client, http_session, fetcher, outbound_session=outbound_session
-    )
-
-    handle_update = create_dispatcher(
-        config,
-        db,
-        started_at,
-        client=client,
-        rubrics_admin=runtime.admin,
-    )
-
-    # Best-effort startup checks: neither a failing /me nor a failing
-    # command registration may prevent the bot from running.
     try:
-        me = await client.get_me()
-        logger.info("authorized as bot name=%s", me.get("name"))
-    except Exception as exc:
-        logger.warning("startup_get_me_failed error=%s", exc)
-    try:
-        await client.patch_commands(BOT_COMMANDS)
-    except Exception as exc:
-        logger.warning("startup_patch_commands_failed error=%s", exc)
+        client = MaxClient(config.bot_token, session=http_session)
+        fetcher = CompositeFetcher(session=http_session)
 
-    background_tasks = [
-        asyncio.create_task(slot_scheduler_loop(runtime.scheduler, db)),
-        asyncio.create_task(daily_summary_loop(runtime.summary, db)),
-        asyncio.create_task(
-            daily_backup_loop(runtime.backup, db, alerter=runtime.alerter)
-        ),
-    ]
-    logger.info(
-        "rubrics_contour_started dry_run=%s rubrics=%s summary_time=%s",
-        config.rubrics.dry_run,
-        len([r for r in config.rubrics.rubrics if r.enabled]),
-        config.rubrics.summary_time,
-    )
+        started_at = datetime.now(timezone.utc)
 
-    polling_task = asyncio.create_task(polling_loop(client, handle_update, db))
+        # The rubrics contour is the only publishing contour: its
+        # construction probes the wired LLM channels (the single network
+        # call) and wires the pipelines, the slot scheduler and the admin
+        # levers.
+        runtime = await build_rubrics_runtime(
+            config,
+            db,
+            client,
+            http_session,
+            fetcher,
+            outbound_session=outbound_session,
+        )
 
-    try:
-        # polling replaces the source dispatcher.start_polling: it is the
-        # main awaited task and everything else is cancelled when it ends
-        await polling_task
+        handle_update = create_dispatcher(
+            config,
+            db,
+            started_at,
+            client=client,
+            rubrics_admin=runtime.admin,
+        )
+
+        # Best-effort startup checks: neither a failing /me nor a failing
+        # command registration may prevent the bot from running.
+        try:
+            me = await client.get_me()
+            logger.info("authorized as bot name=%s", me.get("name"))
+        except Exception as exc:
+            logger.warning("startup_get_me_failed error=%s", exc)
+        try:
+            await client.patch_commands(BOT_COMMANDS)
+        except Exception as exc:
+            logger.warning("startup_patch_commands_failed error=%s", exc)
+
+        background_tasks = [
+            asyncio.create_task(slot_scheduler_loop(runtime.scheduler, db)),
+            asyncio.create_task(daily_summary_loop(runtime.summary, db)),
+            asyncio.create_task(
+                daily_backup_loop(runtime.backup, db, alerter=runtime.alerter)
+            ),
+        ]
+        logger.info(
+            "rubrics_contour_started dry_run=%s rubrics=%s summary_time=%s",
+            config.rubrics.dry_run,
+            len([r for r in config.rubrics.rubrics if r.enabled]),
+            config.rubrics.summary_time,
+        )
+
+        polling_task = asyncio.create_task(polling_loop(client, handle_update, db))
+
+        try:
+            # polling replaces the source dispatcher.start_polling: it is
+            # the main awaited task and everything else is cancelled when
+            # it ends
+            await polling_task
+        finally:
+            for task in [polling_task, *background_tasks]:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
     finally:
-        for task in [polling_task, *background_tasks]:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+        # closed last, after the tasks are cancelled: a startup failure
+        # must not leak "Unclosed client session" noise into crash-loop
+        # logs
         if outbound_session is not None:
             await outbound_session.close()
         await http_session.close()

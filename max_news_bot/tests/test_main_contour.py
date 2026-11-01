@@ -249,6 +249,32 @@ async def test_readiness_config_kind_fails_startup_before_any_task(
     assert recorder.started == []
 
 
+async def test_startup_failure_closes_both_sessions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # a config-kind startup failure must not leak the sessions: main()
+    # closes them before re-raising, keeping crash-loop logs free of
+    # "Unclosed client session" noise (seen on the VPS 401 crash-loop)
+    _base_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("EGRESS_PROXY_URL", "socks5h://127.0.0.1:1080")
+
+    captured: dict[str, Any] = {}
+
+    async def failing_build(config, db, client, session, fetcher, **kwargs):
+        captured["direct"] = session
+        captured["outbound"] = kwargs["outbound_session"]
+        raise ValueError("readiness probe failed")
+
+    monkeypatch.setattr(main_module, "build_rubrics_runtime", failing_build)
+
+    with pytest.raises(ValueError, match="readiness probe failed"):
+        await asyncio.wait_for(main_module.main(), timeout=10)
+
+    assert captured["direct"].closed is True
+    assert captured["outbound"].closed is True
+
+
 @pytest.mark.parametrize("channel", ["primary", "fallback"])
 async def test_readiness_infra_kind_warns_and_startup_continues(
     recorder: LoopRecorder,
