@@ -169,8 +169,8 @@ async def test_main_dry_run_by_default(
     captured: dict[str, object] = {}
     real_build = main_module.build_rubrics_runtime
 
-    async def spy_build(config, db, client, session, fetcher):
-        runtime = await real_build(config, db, client, session, fetcher)
+    async def spy_build(config, db, client, session, fetcher, **kwargs):
+        runtime = await real_build(config, db, client, session, fetcher, **kwargs)
         captured["dry_run"] = runtime.scheduler._dry_run
         return runtime
 
@@ -193,8 +193,8 @@ async def test_contour_wires_fallback_completion_and_probes_channels(
     captured: dict[str, object] = {}
     real_build = main_module.build_rubrics_runtime
 
-    async def spy_build(config, db, client, session, fetcher):
-        runtime = await real_build(config, db, client, session, fetcher)
+    async def spy_build(config, db, client, session, fetcher, **kwargs):
+        runtime = await real_build(config, db, client, session, fetcher, **kwargs)
         captured["runtime"] = runtime
         captured["config"] = config
         captured["db"] = db

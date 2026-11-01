@@ -148,6 +148,7 @@ class RubricsRuntime:
 async def _build_completion(
     config: AppConfig,
     http_session: aiohttp.ClientSession | None,
+    outbound_session: aiohttp.ClientSession | None,
     db: Database,
     alerter: MaxAlerter,
 ) -> LlmCompletion | None:
@@ -155,7 +156,9 @@ async def _build_completion(
 
     when the fallback channel is configured (dual-channel plan §2.3);
     both wired channels are readiness-probed here (§2.1) — the single
-    network call of the contour's construction, before the first slot."""
+    network call of the contour's construction, before the first slot.
+    The primary (OpenRouter) egresses over the socks5h proxy session when
+    one is configured; the fallback (Yandex) stays direct (ADR-005)."""
     llm = config.rubrics.llm.primary
     if not llm.api_key:
         return None
@@ -167,7 +170,7 @@ async def _build_completion(
         max_tokens=llm.max_tokens,
         temperature=llm.temperature,
         disable_reasoning=llm.disable_reasoning,
-        session=http_session,
+        session=outbound_session or http_session,
     )
     fallback_llm = config.rubrics.llm.fallback
     fallback = (
@@ -186,7 +189,9 @@ async def _build_completion(
             session=http_session,
         )
     )
-    await probe_llm_channels(config.rubrics.llm, http_session)
+    await probe_llm_channels(
+        config.rubrics.llm, outbound_session or http_session, http_session
+    )
     if fallback is None:
         # a single channel is valid only outside LLM contours
         return primary
@@ -194,13 +199,16 @@ async def _build_completion(
 
 
 def _build_image_generator(
-    rubrics: RubricsConfig, http_session: aiohttp.ClientSession | None
+    rubrics: RubricsConfig,
+    http_session: aiohttp.ClientSession | None,
+    outbound_session: aiohttp.ClientSession | None,
 ) -> ImageGenerator | None:
     """fal.ai primary wrapped into the failover shell (dual-channel plan
     §3.2): the provider is active iff its key is configured. Construction
     stays offline, so this keeps the "one network call" invariant; the
     fail-fast for ``image: generate`` rubrics without a key already ran in
-    config validation."""
+    config validation. fal.ai egresses over the socks5h proxy session when
+    one is configured (ADR-005)."""
     api_key = os.getenv("FAL_KEY", "").strip()
     if not api_key:
         return None
@@ -209,7 +217,7 @@ def _build_image_generator(
             api_key=api_key,
             model=rubrics.image_generation.fal.model,
             timeout=rubrics.image_generation.timeout_seconds,
-            session=http_session,
+            session=outbound_session or http_session,
         )
     )
 
@@ -220,6 +228,8 @@ async def build_rubrics_runtime(
     client: MaxClient,
     http_session: aiohttp.ClientSession | None,
     fetcher: Fetcher,
+    *,
+    outbound_session: aiohttp.ClientSession | None = None,
 ) -> RubricsRuntime:
     """Wire the whole rubrics contour.
 
@@ -236,9 +246,11 @@ async def build_rubrics_runtime(
     filter_log = FilterLogRepository(db.path)
     digest_items = DigestItemsRepository(db.path)
     alerter = MaxAlerter(client, config.admin_ids)
-    completion = await _build_completion(config, http_session, db, alerter)
+    completion = await _build_completion(
+        config, http_session, outbound_session, db, alerter
+    )
     generated_dir = db.path.parent / GENERATED_DIR_NAME
-    images = _build_image_generator(rubrics, http_session)
+    images = _build_image_generator(rubrics, http_session, outbound_session)
 
     enabled = [rubric for rubric in rubrics.rubrics if rubric.enabled]
     needs_llm = any(rubric.kind in LLM_KINDS for rubric in enabled)

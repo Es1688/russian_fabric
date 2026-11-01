@@ -17,6 +17,7 @@ from max_news_bot.max_api.client import MaxClient
 from max_news_bot.parsers.composite import CompositeFetcher
 from max_news_bot.utils.db import Database
 from max_news_bot.utils.logging import get_logger, setup_logging
+from max_news_bot.utils.proxy import egress_connector_from_env
 
 
 logger = get_logger(__name__)
@@ -28,10 +29,20 @@ async def main() -> None:
     db = Database(config.data_path)
     await db.initialize()
 
-    # One shared ClientSession per process: the MAX client, RSS fetching of
-    # the digest rubric and the LLM completion client; closed in the finally
-    # block below.
+    # One shared direct ClientSession per process: the MAX client, RSS
+    # fetching, weather and the Yandex fallback channel; closed in the
+    # finally block below.
     http_session = aiohttp.ClientSession()
+
+    # Foreign endpoints (OpenRouter, fal.ai) egress through the host-local
+    # socks5h proxy when EGRESS_PROXY_URL is set; without it everything
+    # stays direct (ADR-005).
+    egress_connector = egress_connector_from_env()
+    outbound_session: aiohttp.ClientSession | None = (
+        aiohttp.ClientSession(connector=egress_connector)
+        if egress_connector is not None
+        else None
+    )
 
     client = MaxClient(config.bot_token, session=http_session)
     fetcher = CompositeFetcher(session=http_session)
@@ -41,7 +52,9 @@ async def main() -> None:
     # The rubrics contour is the only publishing contour: its construction
     # probes the wired LLM channels (the single network call) and wires the
     # pipelines, the slot scheduler and the admin levers.
-    runtime = await build_rubrics_runtime(config, db, client, http_session, fetcher)
+    runtime = await build_rubrics_runtime(
+        config, db, client, http_session, fetcher, outbound_session=outbound_session
+    )
 
     handle_update = create_dispatcher(
         config,
@@ -88,6 +101,8 @@ async def main() -> None:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        if outbound_session is not None:
+            await outbound_session.close()
         await http_session.close()
 
 

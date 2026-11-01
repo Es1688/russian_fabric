@@ -21,8 +21,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import aiohttp
 import pytest
 from aiohttp import web
+from aiohttp_socks import ProxyConnector
 
 from max_news_bot.bank.pipeline import BankPipeline
 from max_news_bot.bot.rubrics_runtime import (
@@ -508,6 +510,89 @@ async def test_image_generator_inactive_without_fal_key(
     )
     assert generative._images._generator is None
     assert generative._images._directory == db.path.parent / GENERATED_DIR_NAME
+
+
+# --- egress proxy wiring (ADR-005) ------------------------------------------------
+
+
+async def test_outbound_session_reaches_only_foreign_clients(
+    app_config: AppConfig, db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A socks5h egress session goes to the foreign clients only: the
+    primary (OpenRouter) LLM client and fal; the fallback (Yandex) client
+    keeps the direct session (failover independence, ADR-005)."""
+    monkeypatch.setenv("FAL_KEY", "test-fal-key")
+    direct = aiohttp.ClientSession()
+    # a real ProxyConnector on a dead loopback port: the connector type is
+    # what matters here, no request is sent through it
+    outbound = aiohttp.ClientSession(
+        connector=ProxyConnector("127.0.0.1", 1, rdns=True)
+    )
+    try:
+        runtime = await build_rubrics_runtime(
+            app_config,
+            db,
+            DummyMaxClient(),
+            direct,
+            MockFetcher(),
+            outbound_session=outbound,
+        )
+
+        generative = runtime.scheduler._pipeline.pipeline_for(
+            next(r for r in app_config.rubrics.rubrics if r.kind == "generative")
+        )
+        completion = generative._llm
+        assert completion._primary._session is outbound
+        assert completion._fallback._session is direct
+        images = generative._images._generator
+        assert isinstance(images, FallbackImageGenerator)
+        assert images._primary._session is outbound
+    finally:
+        await outbound.close()
+        await direct.close()
+
+
+async def test_outbound_session_carries_the_primary_probe(
+    app_config: AppConfig,
+    db: Database,
+    llm_channels,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The primary readiness probe goes over the egress session (here a dead
+    loopback socks port — an infra-kind WARNING, not a launch failure), the
+    fallback probe stays direct and reaches its fake channel."""
+    primary, fallback = llm_channels
+    direct = aiohttp.ClientSession()
+    outbound = aiohttp.ClientSession(
+        connector=ProxyConnector("127.0.0.1", 1, rdns=True)
+    )
+    try:
+        with caplog.at_level(logging.WARNING):
+            await build_rubrics_runtime(
+                app_config,
+                db,
+                DummyMaxClient(),
+                direct,
+                MockFetcher(),
+                outbound_session=outbound,
+            )
+    finally:
+        await outbound.close()
+        await direct.close()
+
+    # the probe never reached the primary fake: it went through the dead
+    # proxy and degraded honestly
+    assert len(primary.requests) == 0
+    degraded = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+        and "llm_probe_degraded" in record.getMessage()
+    ]
+    assert degraded
+    assert "channel=primary" in degraded[0].getMessage()
+    # the fallback probe stayed direct and succeeded
+    assert len(fallback.requests) == 1
 
 
 # --- router ---------------------------------------------------------------------

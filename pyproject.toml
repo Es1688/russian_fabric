@@ -8,6 +8,7 @@ dependencies = [
     "feedparser",
     "pyyaml",
     "python-dotenv",
+    "aiohttp-socks>=0.12.0",
 ]
 
 [dependency-groups]

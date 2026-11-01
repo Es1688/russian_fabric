@@ -126,6 +126,7 @@ fail-fast ошибкой). Второй провайдер YandexART — зар�
 | `LLM_FALLBACK_BASE_URL` | база URL резервного канала (дефолт `https://ai.api.cloud.yandex.net/v1`) |
 | `LLM_FALLBACK_MODEL` | модель резервного канала: `gpt://<folder_id>/yandexgpt-5-lite` |
 | `FAL_KEY` | ключ fal.ai — генерация картинок для рубрик с `image: generate`; обязателен при таких рубриках |
+| `EGRESS_PROXY_URL` | socks5h-прокси (строго `socks5h://host:port`) для иностранных API — OpenRouter и fal.ai; пусто (дефолт) = всё напрямую. На VPS — локальный вход stelthVPN `socks5h://127.0.0.1:1080` (порт = `STELTHVPN_RU_BOT_SOCKS_PORT`), требует `network_mode: host` в compose (ADR-005) |
 | `RUBRICS_DRY_RUN` | dry-run контура (дефолт `true`): посты уходят админам из `ADMIN_IDS`, а не в канал; при `true` `ADMIN_IDS` обязателен |
 | `RUBRICS_CONFIG_PATH` | путь к yaml рубрик (дефолт `max_news_bot/config/rubrics.yaml`; файл обязателен) |
 

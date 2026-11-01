@@ -31,6 +31,20 @@ def test_package_has_no_telegram_imports() -> None:
         assert "TelegramAlerter" not in text, source
 
 
+def test_socks_imports_confined_to_proxy_module() -> None:
+    # the proxy is a single seam (ADR-005): aiohttp_socks may only be
+    # imported by utils/proxy.py, so the socks connector cannot leak into
+    # unrelated clients
+    allowed = _PACKAGE / "utils" / "proxy.py"
+    for source in _PACKAGE.rglob("*.py"):
+        if "tests" in source.relative_to(_PACKAGE).parts:
+            continue
+        if source == allowed:
+            continue
+        text = source.read_text(encoding="utf-8")
+        assert "aiohttp_socks" not in text, source
+
+
 def test_models_define_news_item() -> None:
     from max_news_bot.core.models import NewsItem
 

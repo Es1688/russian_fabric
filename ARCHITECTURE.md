@@ -20,8 +20,9 @@ OpenRouter первичным каналом, Yandex AI Studio резервны�
 
 Исходный бот публиковал дайджест в Telegram и генерировал посты через зарубежный
 OpenAI-совместимый провайдер. Обе платформы из РФ требуют обходных решений (прокси),
-что усложняет деплой и делает его хрупким. Цель порта — полностью российский стек
-доставки, работающий с VPS в РФ напрямую, без прокси-переменных и socks-зависимостей.
+что усложняет деплой и делает его хрупким. Цель порта — российский стек доставки,
+работающий с VPS в РФ напрямую, без прокси-переменных и socks-зависимостей
+(позднее смягчено точечно для иностранных API — ADR-005).
 
 ### Решения
 
@@ -38,9 +39,11 @@ OpenAI-совместимый провайдер. Обе платформы из
    модель `gpt://<folder_id>/yandexgpt-5-lite`) вместо native Completion API Yandex:
    код `LlmWriter` не меняется (та же схема `base_url` + `model` + OpenAI-протокол),
    провайдер переключается переменными окружения.
-4. **Без прокси.** platform-api2.max.ru и ai.api.cloud.yandex.net доступны с
-   российских IP напрямую; из зависимостей удалены aiogram и aiohttp-socks,
-   прокси-переменные окружения убраны.
+4. **Без прокси для RU-платформ.** platform-api2.max.ru и
+   ai.api.cloud.yandex.net доступны с российских IP напрямую; из зависимостей
+   удалены aiogram и aiohttp-socks, прокси-переменные окружения убраны.
+   Позже `aiohttp-socks` вернулся точечно — egress-прокси только для
+   иностранных API (ADR-005); RU-платформы по-прежнему ходят напрямую.
 
 ### Различия MAX vs Telegram, учтённые в коде
 
@@ -75,7 +78,9 @@ OpenAI-совместимый провайдер. Обе платформы из
 - `PostPublisher` обрабатывает HTTP 429 (`MaxRateLimitError`) и держит паузу между
   постами под лимит 2 msg/sec на диалог.
 - `/factory retract` удаляет сообщение из канала по `mid`.
-- Тест архитектуры банит aiogram/aiohttp-socks в зависимостях.
+- Тест архитектуры банит aiogram; `aiohttp-socks` позже возвращён точечно для
+  egress-прокси иностранных API, и тест ограничивает его импорт модулем
+  `utils/proxy.py` (ADR-005).
 
 ---
 
@@ -285,6 +290,62 @@ visual-studio на aiohttp), а YandexART зарезервировать заг�
 - История ADR-001–003 сохраняет силу, кроме упоминаний wiring'а фабрики
   (`FallbackWriter` в `main.py`), которое заменил `FallbackCompletion`
   в `bot/rubrics_runtime.py`.
+
+---
+
+## ADR-005: Egress-прокси для иностранных API (OpenRouter, fal.ai)
+
+Статус: принято.
+
+### Контекст и причины
+
+Бот задеплоен на RU VPS, где рядом работает персональный VPN-кластер stelthVPN
+(Xray) с выделенным локальным socks5-входом `bot_socks_in`, слушающим только
+loopback хоста (`socks5h://127.0.0.1:1080`, порт — `STELTHVPN_RU_BOT_SOCKS_PORT`
+в её `.env`). OpenRouter и fal.ai из РФ нестабильны, и это единственный
+иностранный трафик бота: MAX API, резервный Yandex LLM, RSS и погода доступны
+из РФ напрямую (ADR-001) и через прокси не гоняются. Брифинг stelthVPN требует
+семантику `socks5h` (DNS резолвится на стороне foreign-узла — домены не утекают
+RU-резолверам, `rdns=True`) и запрещает менять её конфиги ради бота.
+
+### Решения
+
+1. `EGRESS_PROXY_URL` (только `.env`, дефолт пуст = всё напрямую — локальная
+   разработка не меняется): строго `socks5h://host:port` без userinfo; любое
+   отклонение — включая `socks5://` (это `rdns=False`, молчаливый DNS-лик),
+   `http(s)://`, URL без порта, URL с кредами — ValueError при старте
+   (`utils/proxy.py`): fail-fast вместо невнятной ошибки в рантайме.
+2. Отдельная `aiohttp.ClientSession` с `ProxyConnector(rdns=True)` в
+   `main.py`, которую получают только иностранные клиенты: первичный LLM
+   (OpenRouter), генератор картинок fal.ai и проба готовности primary-канала
+   (проба fallback-канала Yandex — по прямой сессии). Общая прямая сессия
+   (MAX, Yandex fallback, RSS, погода) не меняется.
+3. Контейнер переведён на `network_mode: host`: прокси слушает только
+   loopback хоста и из bridge-сети недостижим.
+4. `aiohttp-socks` вернулся в зависимости точечно: тест архитектуры
+   ограничивает его импорт модулем `utils/proxy.py`.
+
+### Последствия
+
+- Security trade-off host-сети (осознанно): процесс бота получает сетевой
+  доступ ко **всем** loopback-сервисам хоста (включая прочие инбаунды Xray),
+  а не только к `127.0.0.1:1080`; митигируется single-purpose VPS,
+  непривилегированным appuser (uid 10001) и отсутствием у бота входящих
+  портов. Отвергнутые альтернативы: `extra_hosts: host.docker.internal`
+  (прокси loopback-only, подключения по IP хоста не примет), socat/`ssh -L`
+  форвардинг на bridge-шлюз (требует нелупбэк-слушанья или правки конфигов
+  stelthVPN, что запрещено её брифингом).
+- Сетевое следствие host-режима: весь прямой трафик (MAX, Yandex, RSS,
+  погода) резолвится стеком хоста, включая IPv6; при деплое убедиться, что
+  на хосте нет битого IPv6, иначе латентность прямых каналов вырастет на
+  connect-таймауты.
+- Режимы отказа: прокси/foreign-узел недоступен → primary-проба на старте
+  деградирует в WARNING `llm_probe_degraded` (не блокирует запуск), в
+  рантайме работает per-request failover на Yandex (`llm_fallback_used`),
+  картинки деградируют в посты без картинки (`image_none`). Прокси — единая
+  точка отказа для primary-LLM и картинок (у fal.ai второго провайдера нет).
+- Откат к «всё напрямую» — только через новый ADR (см. ADR-001, решение 4:
+  изначальный запрет прокси относился к RU-платформам и смягчён точечно).
 
 ---
 
@@ -642,6 +703,7 @@ LLM_MODEL=
 LLM_FALLBACK_BASE_URL=
 LLM_FALLBACK_MODEL=
 FAL_KEY=
+EGRESS_PROXY_URL=
 RUBRICS_DRY_RUN=
 RUBRICS_CONFIG_PATH=
 ```
@@ -650,7 +712,7 @@ RUBRICS_CONFIG_PATH=
 `LLM_FALLBACK_BASE_URL`/`LLM_FALLBACK_MODEL` — резервный (Yandex);
 `RUBRICS_DRY_RUN=false` переключает превью админам на публикацию в канал.
 
-Переменные окружения имеют приоритет над YAML, чтобы настройки можно было менять в Docker без пересборки образа. Прокси-переменных нет: обе платформы (MAX, Yandex) доступны из РФ напрямую (ADR-001).
+Переменные окружения имеют приоритет над YAML, чтобы настройки можно было менять в Docker без пересборки образа. Прокси один и точечный: `EGRESS_PROXY_URL` (`socks5h://…`) заводит egress-сессию только для иностранных API — OpenRouter и fal.ai (ADR-005); MAX, Yandex, RSS и погода ходят напрямую (ADR-001).
 
 ---
 
@@ -734,8 +796,9 @@ services:
 
 Продакшен-варианты: `infra/compose.prod.yml` (локальный запуск с теми же именами,
 что на VPS) и `infra/compose.prod.vps.yml` (шаблон с подстановками `__BOT_IMAGE__` /
-`__APP_DIR__`, который рендерит CI через sed; проект `-p maxnewsbot`, сеть
-`maxnewsbot-net`, каталог на VPS — `/opt/maxnewsbot`).
+`__APP_DIR__`, который рендерит CI через sed; проект `-p maxnewsbot`,
+`network_mode: host` — loopback-доступ к socks5h-прокси stelthVPN, ADR-005;
+каталог на VPS — `/opt/maxnewsbot`).
 
 ---
 
@@ -749,8 +812,9 @@ services:
 - `test_main_contour.py` — старт единственного контура, проба LLM-каналов до задач;
 - `test_fallback_llm.py` — `FallbackCompletion` против локальных aiohttp-серверов (200/401/429/500, мусорный JSON), события и алерты;
 - `test_rubrics_runtime.py` — сборка контура, binding пайплайнов, проба каналов;
+- `test_proxy.py` — egress-коннектор: строго `socks5h://` (`rdns=True`), fail-fast на остальные схемы;
 - `test_formatter.py`, `test_validator.py`, `test_sanitize.py` — границы длин, «злые» кейсы санитайзера;
-- `test_architecture.py` — инварианты: в зависимостях нет aiogram/тяжёлых библиотек;
+- `test_architecture.py` — инварианты: в зависимостях нет aiogram/тяжёлых библиотек, `aiohttp_socks` импортируется только из `utils/proxy.py`;
 - `test_healthcheck.py` — правила healthcheck (только слоты) на временной SQLite-базе.
 
 Интеграционные тесты с реальным MAX API на MVP не нужны. MAX лучше мокать через
@@ -764,6 +828,7 @@ services:
 
 ```text
 aiohttp
+aiohttp-socks
 feedparser
 pyyaml
 python-dotenv
@@ -771,9 +836,10 @@ pytest
 pytest-asyncio
 ```
 
-Сознательно нет: `aiogram` (заменён тонким клиентом `max_api` + long polling),
-`aiohttp-socks` и прокси-переменные (платформы доступны из РФ напрямую), SDK MAX
-(`max-botapi-python`, `aiomax`) — см. ADR-001.
+Сознательно нет: `aiogram` (заменён тонким клиентом `max_api` + long polling) и
+SDK MAX (`max-botapi-python`, `aiomax`) — см. ADR-001. Глобальных
+прокси-переменных нет: `aiohttp-socks` используется точечно для egress-прокси
+иностранных API (ADR-005).
 
 Зависимости задаются в `pyproject.toml` (корень репозитория), локально — `uv sync`.
 HTML-зависимостей (beautifulsoup4, lxml) не будет: RSS-only — архитектурное решение.

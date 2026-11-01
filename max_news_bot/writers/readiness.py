@@ -79,13 +79,24 @@ async def probe_llm_channel(
 
 async def probe_llm_channels(
     channels: LlmChannelsConfig,
-    session: aiohttp.ClientSession | None,
+    primary_session: aiohttp.ClientSession | None,
+    fallback_session: aiohttp.ClientSession | None = None,
 ) -> None:
     """Probe the primary channel and, when configured, the fallback —
     the failover wiring decides which channels exist, this only mirrors
-    it (callers probe exactly the channels they have wired)."""
-    wired: list[tuple[str, LlmConfig]] = [("primary", channels.primary)]
+    it (callers probe exactly the channels they have wired).
+
+    Each channel is probed over the session its runtime traffic will use:
+    the primary (OpenRouter) over ``primary_session`` (the socks5h egress
+    session when a proxy is configured, ADR-005), the fallback (Yandex)
+    over ``fallback_session`` — or, when omitted, the primary session
+    (single-session callers)."""
+    wired: list[tuple[str, LlmConfig, aiohttp.ClientSession | None]] = [
+        ("primary", channels.primary, primary_session)
+    ]
     if channels.fallback is not None:
-        wired.append(("fallback", channels.fallback))
-    for channel, llm in wired:
+        wired.append(
+            ("fallback", channels.fallback, fallback_session or primary_session)
+        )
+    for channel, llm, session in wired:
         await probe_llm_channel(channel, llm, session)

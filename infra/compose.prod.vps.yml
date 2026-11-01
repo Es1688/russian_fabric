@@ -22,9 +22,7 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-    networks:
-      - maxnewsbot-net
-
-networks:
-  maxnewsbot-net:
-    driver: bridge
+    # Host network: the socks5h egress proxy for foreign APIs (ADR-005)
+    # listens on the host loopback only, which a bridge network cannot
+    # reach; trade-offs are recorded in ARCHITECTURE.md ADR-005.
+    network_mode: host
