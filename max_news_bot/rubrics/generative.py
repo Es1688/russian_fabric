@@ -25,9 +25,10 @@ LLM round): the bytes land in ``data/generated/<slot_run_id>.png`` and the
 outcome carries ``image_ref = "generated:<file>"`` - the file persists, so
 a publish retry reuses it instead of regenerating. Any generation failure
 degrades to a text-only post (warning + bot_stats ``image_none`` + the
-outcome alert line); a config-kind error additionally fires the immediate
-admin alert. The shared ``GeneratedImages`` helper also serves the bank
-pipeline's ``image: generate`` branch.
+outcome alert line); the success events (``image_fal_ok`` /
+``image_art_used``) and the per-channel config alerts live in the failover
+wrapper (images/fallback.py). The shared ``GeneratedImages`` helper also
+serves the bank pipeline's ``image: generate`` branch.
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ import asyncio
 import re
 from collections import OrderedDict
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -52,7 +53,6 @@ from max_news_bot.config.rubrics import (
 )
 from max_news_bot.core.models import ContentBankItem, FilterLogEntry
 from max_news_bot.images.base import ImageGenerationError, ImageGenerator
-from max_news_bot.publishers.alerter import Alerter
 from max_news_bot.utils.db import Database
 from max_news_bot.utils.logging import get_logger
 from max_news_bot.utils.repositories import (
@@ -151,14 +151,10 @@ class GeneratedImages:
 
     A failure never fails the slot: it degrades to a text-only post with
     a warning, an ``image_none`` bot_stats event and the outcome's alert
-    line (``image_fal_ok`` is logged on success; ``image_art_used``
-    returns together with the real second provider). A config-kind error
-    additionally fires the immediate admin alert - same contract as
-    writers/fallback.py: optional alerter, in-memory dedup of at most one
-    alert per day. fal is the only active provider, so the dedup key is
-    the single "images" channel; the fal/art split returns with the real
-    client. Observability never breaks the slot: event and alert
-    failures are logged and swallowed.
+    line. The success events (``image_fal_ok`` / ``image_art_used``) and
+    the per-channel config alerts live in the failover wrapper
+    (images/fallback.py - the same contract as writers/fallback.py); this
+    helper only records the final outcome of the slot.
     """
 
     def __init__(
@@ -168,14 +164,11 @@ class GeneratedImages:
         *,
         image_style: str,
         db: Database | None = None,
-        alerter: Alerter | None = None,
     ) -> None:
         self._generator = generator
         self._directory = directory
         self._image_style = image_style
         self._db = db
-        self._alerter = alerter
-        self._alerted_on: str | None = None  # UTC date of the last config alert
 
     async def slot_ref(
         self, rubric: RubricConfig, run, text: str
@@ -199,9 +192,6 @@ class GeneratedImages:
             raise
         except Exception as exc:  # a broken double or a disk problem
             return await self._degraded(rubric, "infra", _safe_error(exc))
-        await self._emit(
-            "image_fal_ok", f"rubric={rubric.id} run={run.id} file={name}"
-        )
         return f"generated:{name}", None
 
     # --- internals ----------------------------------------------------------
@@ -225,31 +215,11 @@ class GeneratedImages:
             f"rubric={rubric.id} kind={kind} "
             f"error={_truncate(error, _ERROR_MAX_CHARS)}",
         )
-        if kind == "config":
-            await self._alert_config_error(error)
         return None, (
             f"Image generation failed in rubric {rubric.id} ({kind}): "
             f"{_truncate(error, _ERROR_MAX_CHARS)}; the post goes out "
             "without a picture."
         )
-
-    async def _alert_config_error(self, error: str) -> None:
-        if self._alerter is None:
-            return
-        today = datetime.now(timezone.utc).date().isoformat()
-        if self._alerted_on == today:
-            return
-        try:
-            await self._alerter.send_alert(
-                f"Image generation config error ({error}); check FAL_KEY "
-                "and billing. Posts degrade to text-only."
-            )
-        except Exception as exc:
-            # the dedup key stays unset: a failed delivery must not consume
-            # the daily alert, the next config error retries
-            logger.error("image_alert_failed error=%s", exc)
-            return
-        self._alerted_on = today
 
     async def _emit(self, event: str, details: str) -> None:
         if self._db is None:
@@ -369,7 +339,6 @@ class GenerativePipeline:
         images: ImageGenerator | None = None,
         generated_dir: Path | None = None,
         db: Database | None = None,
-        alerter: Alerter | None = None,
     ) -> None:
         self._persona = config.persona
         self._llm = llm
@@ -381,7 +350,6 @@ class GenerativePipeline:
             generated_dir,
             image_style=config.image_style,
             db=db,
-            alerter=alerter,
         )
         self._tz = self._load_timezone(config.timezone)
         # A config typo in a validator name must abort the launch (plan

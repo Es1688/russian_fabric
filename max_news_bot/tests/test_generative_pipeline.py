@@ -239,7 +239,6 @@ def make_pipeline(
     images: FallbackImageGenerator | None = None,
     generated_dir: Path | None = None,
     db: Database | None = None,
-    alerter: MockAlerter | None = None,
 ) -> GenerativePipeline:
     return GenerativePipeline(
         make_config(rubrics, persona=persona, image_style=image_style),
@@ -250,7 +249,6 @@ def make_pipeline(
         images=images,
         generated_dir=generated_dir,
         db=db,
-        alerter=alerter,
     )
 
 
@@ -779,7 +777,7 @@ async def test_image_generate_writes_file_and_generated_ref(
         [rubric],
         MockLlm([GOOD_TEXT, "нет"]),
         image_style=IMAGE_STYLE,
-        images=FallbackImageGenerator(generator, None),
+        images=FallbackImageGenerator(generator, None, db=db),
         generated_dir=generated_dir,
         db=db,
     )
@@ -794,8 +792,9 @@ async def test_image_generate_writes_file_and_generated_ref(
     # deterministic prompt, no LLM round: style + first ~200 chars of the post
     assert generator.prompts == [f"{IMAGE_STYLE}\n{GOOD_TEXT[:200]}"]
     assert all(len(prompt) <= 500 for prompt in generator.prompts)
+    # the success event is emitted by the failover wrapper, provider-named
     event = await db.get_last_event("image_fal_ok")
-    assert event is not None and f"run={run.id}" in event["details"]
+    assert event is not None and "provider=fal" in event["details"]
     assert await db.get_last_event("image_none") is None
 
 
@@ -813,11 +812,13 @@ async def test_image_failure_degrades_to_text_only_with_alert_and_event(
         [rubric],
         MockLlm([GOOD_TEXT, "нет"]),
         images=FallbackImageGenerator(
-            MockImageGenerator([ImageGenerationError("infra", "fal http 500")]), None
+            MockImageGenerator([ImageGenerationError("infra", "fal http 500")]),
+            None,
+            db=db,
+            alerter=alerter,
         ),
         generated_dir=tmp_path / "generated",
         db=db,
-        alerter=alerter,
     )
 
     outcome = await pipeline.generate(
@@ -847,11 +848,13 @@ async def test_image_config_error_alerts_admins_once_per_day(
         [rubric],
         MockLlm([GOOD_TEXT, "нет", GOOD_TEXT, "нет"]),
         images=FallbackImageGenerator(
-            MockImageGenerator([ImageGenerationError("config", "fal http 401")]), None
+            MockImageGenerator([ImageGenerationError("config", "fal http 401")]),
+            None,
+            db=db,
+            alerter=alerter,
         ),
         generated_dir=tmp_path / "generated",
         db=db,
-        alerter=alerter,
     )
 
     first = await pipeline.generate(
@@ -903,10 +906,11 @@ async def test_image_config_alert_retries_after_delivery_failure(
                 ]
             ),
             None,
+            db=db,
+            alerter=alerter,
         ),
         generated_dir=tmp_path / "generated",
         db=db,
-        alerter=alerter,
     )
 
     first = await pipeline.generate(
@@ -941,6 +945,7 @@ async def test_fallback_generator_rescues_the_image(
         images=FallbackImageGenerator(
             MockImageGenerator([ImageGenerationError("infra", "fal http 500")]),
             MockImageGenerator([PNG_BYTES]),
+            db=db,
         ),
         generated_dir=generated_dir,
         db=db,
@@ -953,7 +958,8 @@ async def test_fallback_generator_rescues_the_image(
     assert outcome.image_ref == f"generated:{run.id}.png"
     assert outcome.alert is None
     assert (generated_dir / f"{run.id}.png").read_bytes() == PNG_BYTES
-    assert await db.get_last_event("image_fal_ok") is not None
+    # the reserve served the call: the provider-named wrapper event
+    assert await db.get_last_event("image_art_used") is not None
 
 
 @pytest.mark.asyncio

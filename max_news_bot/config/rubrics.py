@@ -25,6 +25,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 
+from max_news_bot.images.yandex_art import folder_id_from_fallback_model
+
 # Short weekday tokens accepted in rubric `days` and `topics_by_weekday`.
 WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 # Pipelines from plan section 8; an unknown kind is a config typo.
@@ -44,9 +46,10 @@ MAX_POST_CHARS = 4000
 # Daily admin summary slot (plan section 11): a fixed config time after the
 # last post of the grid (21:30), quoted in yaml like rubric times.
 DEFAULT_SUMMARY_TIME = "22:40"
-# Image generation defaults (dual-channel plan section 3.2): fal is the
-# only active provider, yandex_art is reserved as a stub.
+# Image generation defaults (dual-channel plan section 3.2): fixed
+# priority fal -> yandex_art; a provider is active iff its key is set.
 DEFAULT_FAL_MODEL = "fal-ai/flux/dev"
+DEFAULT_YANDEX_ART_MODEL = "aliceai-image-art-3.0"
 DEFAULT_YANDEX_ART_SIZE = "1024x1024"
 DEFAULT_IMAGE_TIMEOUT_SECONDS = 120
 
@@ -65,6 +68,9 @@ _RUBRIC_ID_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 # NOTE: rubric times must be quoted in yaml: unquoted "12:30" parses as a
 # sexagesimal int (750) in YAML 1.1 and would fail validation.
 _TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+# YandexART accepts WxH only; a typo would otherwise fail every request
+# with a silent infra-kind 400.
+_IMAGE_SIZE_RE = re.compile(r"^\d+x\d+$")
 
 _TOP_LEVEL_KEYS = (
     "timezone",
@@ -84,7 +90,7 @@ _WEATHER_KEYS = ("points",)
 _WEATHER_POINT_KEYS = ("name", "latitude", "longitude")
 _IMAGE_GENERATION_KEYS = ("fal", "yandex_art", "timeout_seconds")
 _FAL_IMAGE_KEYS = ("model",)
-_YANDEX_ART_IMAGE_KEYS = ("size",)
+_YANDEX_ART_IMAGE_KEYS = ("model", "size")
 _RUBRIC_KEYS = (
     "id",
     "enabled",
@@ -167,9 +173,11 @@ class FalImageConfig:
 
 @dataclass(frozen=True)
 class YandexArtImageConfig:
-    """Reserved second image provider (stub): parsed and validated but never
-    activated until the real client lands, so it requires no key yet."""
+    """YandexART, the fallback image provider: active iff LLM_API_KEY is
+    set and a real folder id parses from the fallback LLM model URI; the
+    full ``art://<folder_id>/<model>`` URI is assembled in the wiring."""
 
+    model: str = DEFAULT_YANDEX_ART_MODEL
     size: str = DEFAULT_YANDEX_ART_SIZE
 
 
@@ -466,9 +474,6 @@ def _parse_image_generation(raw: Any) -> ImageGenerationConfig:
         )
     )
 
-    # Reserved stub (dual-channel plan section 3): parsed and validated, but
-    # the provider is never activated and no key is required until the real
-    # client lands.
     art_raw = section.get("yandex_art")
     art_section = art_raw if art_raw is not None else {}
     if not isinstance(art_section, Mapping):
@@ -478,11 +483,21 @@ def _parse_image_generation(raw: Any) -> ImageGenerationConfig:
     _reject_unknown_keys(
         art_section, _YANDEX_ART_IMAGE_KEYS, "image_generation.yandex_art"
     )
-    yandex_art = YandexArtImageConfig(
-        size=_as_str(
-            art_section.get("size", DEFAULT_YANDEX_ART_SIZE),
-            "image_generation.yandex_art.size",
+    size = _as_str(
+        art_section.get("size", DEFAULT_YANDEX_ART_SIZE),
+        "image_generation.yandex_art.size",
+    )
+    if not _IMAGE_SIZE_RE.match(size):
+        raise RubricsConfigError(
+            "image_generation.yandex_art.size: expected WxH like "
+            f'"1024x1024", got {size!r}'
         )
+    yandex_art = YandexArtImageConfig(
+        model=_as_str(
+            art_section.get("model", DEFAULT_YANDEX_ART_MODEL),
+            "image_generation.yandex_art.model",
+        ),
+        size=size,
     )
 
     timeout_seconds = _as_int(
@@ -694,6 +709,17 @@ def _parse_rubric(
     )
 
 
+def _image_provider_configured(llm: LlmChannelsConfig) -> bool:
+    """True when at least one image provider can be wired: fal needs
+    FAL_KEY; YandexART shares the fallback LLM channel's key and needs a
+    real folder id inside its model URI."""
+    if os.getenv("FAL_KEY", "").strip():
+        return True
+    if llm.fallback is None or not llm.fallback.api_key:
+        return False
+    return folder_id_from_fallback_model(llm.fallback.model) is not None
+
+
 def _parse_rubrics_config(
     raw: Any, *, source_path: Path
 ) -> RubricsConfig:
@@ -774,16 +800,17 @@ def _parse_rubrics_config(
         )
 
     # Fail-fast (dual-channel plan section 3.2): an enabled rubric with
-    # image: generate needs a working image provider; fal is the only active
-    # one (yandex_art is a stub), so a missing FAL_KEY must abort the launch
-    # instead of degrading every such post to text-only. Checked while the
-    # contour is off too - the yaml is validated on every restart.
+    # image: generate needs at least one active provider - fal (FAL_KEY)
+    # or YandexART (LLM_API_KEY plus a folder id parsable from the fallback
+    # LLM model). An empty pair must abort the launch instead of degrading
+    # every such post to text-only. Checked while the contour is off too -
+    # the yaml is validated on every restart.
     if any(
         rubric.enabled and rubric.image == GENERATE_IMAGE for rubric in rubrics
-    ) and not os.getenv("FAL_KEY", "").strip():
+    ) and not _image_provider_configured(llm):
         raise RubricsConfigError(
-            "image: generate requires the FAL_KEY environment variable: fal "
-            "is the only active image provider (yandex_art is a stub)"
+            "image: generate requires an image provider: FAL_KEY (fal) or "
+            "LLM_API_KEY with a folder_id in LLM_FALLBACK_MODEL (YandexART)"
         )
 
     return RubricsConfig(

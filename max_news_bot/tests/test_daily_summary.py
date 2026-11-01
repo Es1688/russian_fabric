@@ -272,7 +272,7 @@ async def test_build_text_channel_line_counts_events_of_the_day(
         index for index, line in enumerate(lines) if line.startswith("LLM-вызовы")
     )
     assert lines[estimate + 1] == (
-        "LLM: primary 2 / fallback 1; картинки: fal 1 / без картинки 3"
+        "LLM: primary 2 / fallback 1; картинки: fal 1 / art 0 / без картинки 3"
     )
 
 
@@ -286,7 +286,7 @@ async def test_build_text_channel_line_ignores_other_dates(summary_db) -> None:
 
     text = await _service(summary_db).build_text(SLOT_DATE)
 
-    assert "LLM: primary 0 / fallback 0; картинки: fal 0 / без картинки 0" in text
+    assert "LLM: primary 0 / fallback 0; картинки: fal 0 / art 0 / без картинки 0" in text
 
 
 async def test_build_text_channel_line_with_zero_stats_is_meaningful(
@@ -294,7 +294,7 @@ async def test_build_text_channel_line_with_zero_stats_is_meaningful(
 ) -> None:
     text = await _service(summary_db).build_text(SLOT_DATE)
 
-    assert "LLM: primary 0 / fallback 0; картинки: fal 0 / без картинки 0" in text
+    assert "LLM: primary 0 / fallback 0; картинки: fal 0 / art 0 / без картинки 0" in text
 
 
 # --- delivery window and once-a-day rule -------------------------------------------

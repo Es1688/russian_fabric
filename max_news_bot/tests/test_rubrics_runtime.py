@@ -40,7 +40,11 @@ from max_news_bot.config.rubrics import (
     RubricConfig,
     load_rubrics_config,
 )
-from max_news_bot.images import FalImageGenerator, FallbackImageGenerator
+from max_news_bot.images import (
+    FalImageGenerator,
+    FallbackImageGenerator,
+    YandexArtGenerator,
+)
 from max_news_bot.rubrics.digest import DigestPipeline
 from max_news_bot.rubrics.generative import GenerativePipeline
 from max_news_bot.tests.mocks import MockFetcher
@@ -472,7 +476,9 @@ async def test_image_generator_wired_into_pipelines_and_publisher(
     images = generative._images._generator
     assert isinstance(images, FallbackImageGenerator)
     assert isinstance(images._primary, FalImageGenerator)
-    assert images._fallback is None  # yandex_art is a stub (plan §3.1)
+    # the fixture's fallback LLM model carries no folder id, so YandexART
+    # stays unwired here (the dedicated tests below cover the pair)
+    assert images._fallback is None
     assert images._primary._api_key == "test-fal-key"
     assert (
         images._primary._model == app_config.rubrics.image_generation.fal.model
@@ -485,9 +491,11 @@ async def test_image_generator_wired_into_pipelines_and_publisher(
     # and the daily backup TTL-prunes (plan §3.3)
     generated_dir = db.path.parent / GENERATED_DIR_NAME
     assert generative._images._directory == generated_dir
-    # observability of the shared GeneratedImages helper
+    # the slot outcome events of the shared GeneratedImages helper
     assert generative._images._db is db
-    assert generative._images._alerter is runtime.alerter
+    # the per-call events and config alerts live on the wrapper (§2.6)
+    assert images._observer._db is db
+    assert images._observer._alerter is runtime.alerter
     # the bank pipeline (and its digest reserve copy) share one generator
     assert bank._images._generator is images
     assert bank._images._directory == generated_dir
@@ -512,6 +520,113 @@ async def test_image_generator_inactive_without_fal_key(
     assert generative._images._directory == db.path.parent / GENERATED_DIR_NAME
 
 
+def _with_fallback_model(config: AppConfig, model: str) -> AppConfig:
+    """app_config with the fallback LLM model URI swapped: a gpt:// URI
+    with a real folder id also arms the YandexART image provider."""
+    llm = config.rubrics.llm
+    return replace(
+        config,
+        rubrics=replace(
+            config.rubrics,
+            llm=replace(
+                llm,
+                fallback=replace(llm.fallback, model=model),
+            ),
+        ),
+    )
+
+
+async def test_image_generator_wires_fal_and_yandex_art(
+    app_config: AppConfig, db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both keys plus a folder id in the fallback model URI wire the
+    fixed pair fal -> yandex_art: the art client inherits the fallback
+    LLM channel's key, base URL and folder (plan §3.2)."""
+    monkeypatch.setenv("FAL_KEY", "test-fal-key")
+    config = _with_fallback_model(
+        app_config, "gpt://b1gtestfolder/yandexgpt-5-lite"
+    )
+    runtime = await build_rubrics_runtime(
+        config, db, DummyMaxClient(), None, MockFetcher()
+    )
+
+    generative = runtime.scheduler._pipeline.pipeline_for(
+        next(r for r in config.rubrics.rubrics if r.kind == "generative")
+    )
+    images = generative._images._generator
+    assert isinstance(images, FallbackImageGenerator)
+    assert isinstance(images._primary, FalImageGenerator)
+    art = images._fallback
+    assert isinstance(art, YandexArtGenerator)
+    assert art._api_key == "test-fallback-key"
+    assert art._model_uri == "art://b1gtestfolder/aliceai-image-art-3.0"
+    assert art._size == config.rubrics.image_generation.yandex_art.size
+    assert art._timeout == config.rubrics.image_generation.timeout_seconds
+    # the same Yandex gateway the fallback LLM channel uses
+    assert art._base_url == config.rubrics.llm.fallback.base_url
+    # the observer rides on the wrapper in the pair wiring too
+    assert images._observer._db is db
+    assert images._observer._alerter is runtime.alerter
+
+
+async def test_image_generator_yandex_art_alone_without_fal_key(
+    app_config: AppConfig, db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No FAL_KEY but a keyed fallback channel with a folder id:
+    YandexART alone carries the contour, provider-named so its success
+    event stays image_art_used even in the single-provider wiring."""
+    monkeypatch.delenv("FAL_KEY", raising=False)
+    config = _with_fallback_model(
+        app_config, "gpt://b1gtestfolder/yandexgpt-5-lite"
+    )
+    runtime = await build_rubrics_runtime(
+        config, db, DummyMaxClient(), None, MockFetcher()
+    )
+
+    generative = runtime.scheduler._pipeline.pipeline_for(
+        next(r for r in config.rubrics.rubrics if r.kind == "generative")
+    )
+    images = generative._images._generator
+    assert isinstance(images, FallbackImageGenerator)
+    assert isinstance(images._primary, YandexArtGenerator)
+    assert images._fallback is None
+    assert images._primary_name == "yandex_art"
+    # the success event must keep firing without fal wired
+    assert images._observer._db is db
+
+
+async def test_yandex_art_stays_inactive_on_placeholder_folder(
+    app_config: AppConfig,
+    db: Database,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A keyed fallback channel without a parsable folder id must not
+    silently drop the image failover: a startup WARNING names the cause."""
+    monkeypatch.setenv("FAL_KEY", "test-fal-key")
+    config = _with_fallback_model(
+        app_config, "gpt://FOLDER_ID/yandexgpt-5-lite"
+    )
+    with caplog.at_level(logging.WARNING):
+        runtime = await build_rubrics_runtime(
+            config, db, DummyMaxClient(), None, MockFetcher()
+        )
+
+    generative = runtime.scheduler._pipeline.pipeline_for(
+        next(r for r in config.rubrics.rubrics if r.kind == "generative")
+    )
+    images = generative._images._generator
+    assert isinstance(images, FallbackImageGenerator)
+    assert isinstance(images._primary, FalImageGenerator)
+    assert images._fallback is None
+    warnings = [
+        record
+        for record in caplog.records
+        if "yandex_art_inactive" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+
+
 # --- egress proxy wiring (ADR-005) ------------------------------------------------
 
 
@@ -522,6 +637,9 @@ async def test_outbound_session_reaches_only_foreign_clients(
     primary (OpenRouter) LLM client and fal; the fallback (Yandex) client
     keeps the direct session (failover independence, ADR-005)."""
     monkeypatch.setenv("FAL_KEY", "test-fal-key")
+    config = _with_fallback_model(
+        app_config, "gpt://b1gtestfolder/yandexgpt-5-lite"
+    )
     direct = aiohttp.ClientSession()
     # a real ProxyConnector on a dead loopback port: the connector type is
     # what matters here, no request is sent through it
@@ -530,7 +648,7 @@ async def test_outbound_session_reaches_only_foreign_clients(
     )
     try:
         runtime = await build_rubrics_runtime(
-            app_config,
+            config,
             db,
             DummyMaxClient(),
             direct,
@@ -547,6 +665,11 @@ async def test_outbound_session_reaches_only_foreign_clients(
         images = generative._images._generator
         assert isinstance(images, FallbackImageGenerator)
         assert images._primary._session is outbound
+        # YandexART is RU-reachable: it keeps the direct session even with
+        # the proxy configured (failover independence, ADR-005)
+        art = images._fallback
+        assert isinstance(art, YandexArtGenerator)
+        assert art._session is direct
     finally:
         await outbound.close()
         await direct.close()

@@ -744,7 +744,7 @@ async def test_image_generate_writes_file_and_generated_ref(
     pipeline = make_pipeline(
         bank_repo,
         runs_repo,
-        images=FallbackImageGenerator(generator, None),
+        images=FallbackImageGenerator(generator, None, db=db_repo),
         generated_dir=generated_dir,
         db=db_repo,
     )
@@ -757,9 +757,10 @@ async def test_image_generate_writes_file_and_generated_ref(
     # the thin bank's stock alert may fire, but never an image failure
     assert outcome.alert is None or "generation failed" not in outcome.alert
     assert (generated_dir / f"{run.id}.png").read_bytes() == PNG_BYTES
+    # the success event is emitted by the failover wrapper, provider-named
     event = await db_repo.get_last_event("image_fal_ok")
     assert event is not None
-    assert f"run={run.id}" in event["details"]
+    assert "provider=fal" in event["details"]
     assert await db_repo.get_last_event("image_none") is None
 
 

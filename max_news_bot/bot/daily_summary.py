@@ -44,6 +44,7 @@ CHANNEL_EVENTS = (
     "llm_primary_ok",
     "llm_fallback_used",
     "image_fal_ok",
+    "image_art_used",
     "image_none",
 )
 # Plan section 6: alert when a bank type holds less than 30 days of stock;
@@ -227,6 +228,7 @@ class DailySummaryService:
             f"LLM: primary {counts['llm_primary_ok']} / "
             f"fallback {counts['llm_fallback_used']}; "
             f"картинки: fal {counts['image_fal_ok']} / "
+            f"art {counts['image_art_used']} / "
             f"без картинки {counts['image_none']}"
         )
 

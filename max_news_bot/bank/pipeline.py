@@ -59,7 +59,6 @@ from max_news_bot.config.rubrics import (
 )
 from max_news_bot.core.models import ContentBankItem, SlotRun
 from max_news_bot.images.base import ImageGenerator
-from max_news_bot.publishers.alerter import Alerter
 from max_news_bot.rubrics.generative import GeneratedImages
 from max_news_bot.utils.db import Database
 from max_news_bot.utils.logging import get_logger
@@ -245,7 +244,6 @@ class BankPipeline:
         images: ImageGenerator | None = None,
         generated_dir: Path | None = None,
         db: Database | None = None,
-        alerter: Alerter | None = None,
     ) -> None:
         self._tz = ZoneInfo(config.timezone)
         self._persona = config.persona
@@ -257,7 +255,6 @@ class BankPipeline:
             generated_dir,
             image_style=config.image_style,
             db=db,
-            alerter=alerter,
         )
 
     # --- RubricPipeline -------------------------------------------------------

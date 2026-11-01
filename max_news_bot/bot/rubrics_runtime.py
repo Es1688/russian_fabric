@@ -8,7 +8,8 @@ built here:
 - one pipeline per enabled rubric (dispatched by the router below):
   generative / bank / digest / weather;
 - the image generator behind ``image: generate`` rubrics (dual-channel
-  plan §3.2): fal.ai active iff FAL_KEY is set, bytes to
+  plan §3.2): fal.ai active iff FAL_KEY is set with YandexART behind it
+  iff LLM_API_KEY and a folder id are configured, bytes to
   ``data/generated`` (dual-channel plan §3.3);
 - the slot scheduler with the slot publisher, alerter and the contour's
   dry-run flag (``RUBRICS_DRY_RUN``, previews to admins);
@@ -43,8 +44,13 @@ from max_news_bot.bot.slot_scheduler import (
 )
 from max_news_bot.config.news_sources import NewsSource, load_news_sources
 from max_news_bot.config.rubrics import LLM_KINDS, RubricConfig, RubricsConfig
-from max_news_bot.images import FalImageGenerator, FallbackImageGenerator
+from max_news_bot.images import (
+    FalImageGenerator,
+    FallbackImageGenerator,
+    YandexArtGenerator,
+)
 from max_news_bot.images.base import ImageGenerator
+from max_news_bot.images.yandex_art import folder_id_from_fallback_model
 from max_news_bot.publishers.alerter import MaxAlerter
 from max_news_bot.publishers.slot import MaxSlotPublisher
 from max_news_bot.rubrics.digest import DigestPipeline
@@ -198,27 +204,74 @@ async def _build_completion(
     return FallbackCompletion(primary, fallback, db=db, alerter=alerter)
 
 
+def _build_yandex_art_generator(
+    rubrics: RubricsConfig,
+    http_session: aiohttp.ClientSession | None,
+) -> YandexArtGenerator | None:
+    """YandexART is wired iff the fallback LLM channel carries its key and
+    a folder id inside the model URI (both come from LLM_API_KEY /
+    LLM_FALLBACK_MODEL - the same channel serves the reserve LLM and the
+    images). A key without a parsable folder id would silently drop the
+    image failover, so that case logs a startup WARNING."""
+    fallback = rubrics.llm.fallback
+    if fallback is None or not fallback.api_key:
+        return None
+    folder_id = folder_id_from_fallback_model(fallback.model)
+    if folder_id is None:
+        logger.warning(
+            "yandex_art_inactive: no folder id in the fallback LLM model "
+            "%r (LLM_FALLBACK_MODEL); the image contour stays fal-only",
+            fallback.model,
+        )
+        return None
+    return YandexArtGenerator(
+        api_key=fallback.api_key,
+        folder_id=folder_id,
+        model=rubrics.image_generation.yandex_art.model,
+        size=rubrics.image_generation.yandex_art.size,
+        timeout=rubrics.image_generation.timeout_seconds,
+        base_url=fallback.base_url,
+        session=http_session,
+    )
+
+
 def _build_image_generator(
     rubrics: RubricsConfig,
     http_session: aiohttp.ClientSession | None,
     outbound_session: aiohttp.ClientSession | None,
+    db: Database,
+    alerter: MaxAlerter,
 ) -> ImageGenerator | None:
-    """fal.ai primary wrapped into the failover shell (dual-channel plan
-    §3.2): the provider is active iff its key is configured. Construction
-    stays offline, so this keeps the "one network call" invariant; the
-    fail-fast for ``image: generate`` rubrics without a key already ran in
-    config validation. fal.ai egresses over the socks5h proxy session when
-    one is configured (ADR-005)."""
-    api_key = os.getenv("FAL_KEY", "").strip()
-    if not api_key:
-        return None
-    return FallbackImageGenerator(
-        FalImageGenerator(
-            api_key=api_key,
+    """Image providers wrapped into the per-request failover shell
+    (dual-channel plan §3.2) with the fixed priority fal -> YandexART; a
+    provider is active iff its key is configured, the fail-fast for
+    ``image: generate`` rubrics already ran in config validation.
+    Construction stays offline, so this keeps the "one network call"
+    invariant - images are never probed at startup because generation is
+    billed per request; a config-broken channel surfaces on the first
+    real call via the wrapper's alert hook. fal.ai egresses over the
+    socks5h proxy session when one is configured, YandexART stays direct
+    (ADR-005). The observer (bot_stats events + per-channel config
+    alerts) rides on the wrapper in every wiring, single-provider ones
+    included: the success events live there, not in the pipelines."""
+    fal_key = os.getenv("FAL_KEY", "").strip()
+    fal = (
+        None
+        if not fal_key
+        else FalImageGenerator(
+            api_key=fal_key,
             model=rubrics.image_generation.fal.model,
             timeout=rubrics.image_generation.timeout_seconds,
             session=outbound_session or http_session,
         )
+    )
+    art = _build_yandex_art_generator(rubrics, http_session)
+    if fal is None and art is None:
+        return None
+    if fal is not None:
+        return FallbackImageGenerator(fal, art, db=db, alerter=alerter)
+    return FallbackImageGenerator(
+        art, None, primary_name="yandex_art", db=db, alerter=alerter
     )
 
 
@@ -250,7 +303,9 @@ async def build_rubrics_runtime(
         config, http_session, outbound_session, db, alerter
     )
     generated_dir = db.path.parent / GENERATED_DIR_NAME
-    images = _build_image_generator(rubrics, http_session, outbound_session)
+    images = _build_image_generator(
+        rubrics, http_session, outbound_session, db, alerter
+    )
 
     enabled = [rubric for rubric in rubrics.rubrics if rubric.enabled]
     needs_llm = any(rubric.kind in LLM_KINDS for rubric in enabled)
@@ -276,7 +331,6 @@ async def build_rubrics_runtime(
                     images=images,
                     generated_dir=generated_dir,
                     db=db,
-                    alerter=alerter,
                 ),
             )
         elif rubric.kind == "bank":
@@ -290,7 +344,6 @@ async def build_rubrics_runtime(
                     images=images,
                     generated_dir=generated_dir,
                     db=db,
-                    alerter=alerter,
                 ),
             )
         elif rubric.kind == "weather":
@@ -335,7 +388,6 @@ async def build_rubrics_runtime(
         images=images,
         generated_dir=generated_dir,
         db=db,
-        alerter=alerter,
     )
     for rubric in digest_rubrics:
         router.bind(

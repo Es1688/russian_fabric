@@ -412,6 +412,7 @@ def test_image_generation_defaults_without_section(
     config = load_rubrics_config(_write_config(tmp_path, MINIMAL_YAML))
 
     assert config.image_generation.fal.model == "fal-ai/flux/dev"
+    assert config.image_generation.yandex_art.model == "aliceai-image-art-3.0"
     assert config.image_generation.yandex_art.size == "1024x1024"
     assert config.image_generation.timeout_seconds == 120
 
@@ -426,6 +427,7 @@ def test_image_generation_section_parsed(
         "  fal:\n"
         '    model: fal-ai/flux/schnell\n'
         "  yandex_art:\n"
+        "    model: yandex-art/latest\n"
         '    size: "512x512"\n'
         "  timeout_seconds: 60\n"
     ) + MINIMAL_YAML
@@ -433,6 +435,7 @@ def test_image_generation_section_parsed(
     config = load_rubrics_config(_write_config(tmp_path, content))
 
     assert config.image_generation.fal.model == "fal-ai/flux/schnell"
+    assert config.image_generation.yandex_art.model == "yandex-art/latest"
     assert config.image_generation.yandex_art.size == "512x512"
     assert config.image_generation.timeout_seconds == 60
 
@@ -441,7 +444,8 @@ def test_image_generation_section_parsed(
     "section",
     [
         "image_generation:\n  fal:\n    modle: x\n",  # typo inside fal
-        "image_generation:\n  yandex_art:\n    dimensions: x\n",  # typo inside stub
+        "image_generation:\n  yandex_art:\n    dimensions: x\n",  # typo in yandex_art
+        'image_generation:\n  yandex_art:\n    size: square\n',  # not WxH
         "image_generation:\n  ollama: {}\n",  # unknown provider
         "image_generation: 120\n",  # not a mapping
         "image_generation:\n  timeout_seconds: nope\n",  # not an integer
@@ -465,11 +469,12 @@ def test_image_generate_rubric_valid(
     assert config.rubrics[0].image == "generate"
 
 
-def test_generate_image_without_fal_key_fails(
+def test_generate_image_without_any_provider_key_fails(
     rubrics_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # fail-fast (plan section 3.2): the missing key aborts the launch, it
-    # does not degrade the slot to a text-only post silently
+    # fail-fast (plan section 3.2): no FAL_KEY and the fallback LLM model
+    # carries only the FOLDER_ID placeholder, so no provider can be wired;
+    # the launch aborts instead of degrading every image slot to text-only
     monkeypatch.delenv("FAL_KEY", raising=False)
 
     with pytest.raises(RubricsConfigError, match="FAL_KEY"):
@@ -497,11 +502,11 @@ def test_generate_image_disabled_rubric_needs_no_key(
     assert by_id["stub_enabled"].enabled is True
 
 
-def test_yandex_art_section_alone_needs_no_key(
+def test_yandex_art_section_without_generate_rubric_needs_no_key(
     rubrics_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # the stub is parsed and validated but never activates a provider and
-    # requires no key until the real client lands
+    # the section is parsed and validated; without image: generate rubrics
+    # no provider key is bound at all
     monkeypatch.delenv("FAL_KEY", raising=False)
     content = (
         'image_generation:\n  yandex_art:\n    size: "512x512"\n' + MINIMAL_YAML
@@ -512,11 +517,27 @@ def test_yandex_art_section_alone_needs_no_key(
     assert config.image_generation.yandex_art.size == "512x512"
 
 
-def test_generate_with_yandex_art_only_still_requires_fal_key(
+def test_generate_with_yandex_art_only_is_valid(
     rubrics_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # the reserved yandex_art section cannot cover the requirement: fal is
-    # the only active provider (priority is fixed fal -> yandex_art)
+    # LLM_API_KEY plus a real folder id in LLM_FALLBACK_MODEL arms the
+    # YandexART provider: it alone satisfies the fail-fast without fal
+    monkeypatch.delenv("FAL_KEY", raising=False)
+    monkeypatch.setenv(
+        "LLM_FALLBACK_MODEL", "gpt://b1gfolder123/yandexgpt-5-lite"
+    )
+
+    config = load_rubrics_config(_write_config(tmp_path, GENERATE_YAML))
+
+    assert config.rubrics[0].image == "generate"
+    assert config.llm.fallback.model == "gpt://b1gfolder123/yandexgpt-5-lite"
+
+
+def test_generate_with_placeholder_folder_still_fails(
+    rubrics_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # LLM_API_KEY alone is not enough: the FOLDER_ID placeholder carries
+    # no real folder, so the yandex_art section cannot cover the pair
     monkeypatch.delenv("FAL_KEY", raising=False)
     content = (
         'image_generation:\n  yandex_art:\n    size: "512x512"\n' + GENERATE_YAML

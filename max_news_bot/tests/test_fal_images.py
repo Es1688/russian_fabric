@@ -2,12 +2,14 @@
 
 Covers the queue flow against a local FakeFalServer (submit -> poll ->
 response -> download), the error taxonomy (401 -> config, FAILED / 5xx /
-timeout / oversized -> infra), transient-only retries, the YandexArtStub
-contract and the FallbackImageGenerator failover.
+timeout / oversized -> infra), transient-only retries and the
+FallbackImageGenerator failover with its per-provider events and config
+alerts (the YandexART client itself lives in test_yandex_art.py).
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -18,8 +20,9 @@ from max_news_bot.images import (
     FalImageGenerator,
     FallbackImageGenerator,
     ImageGenerationError,
-    YandexArtStub,
 )
+from max_news_bot.tests.mocks import MockAlerter
+from max_news_bot.utils.db import Database
 
 _MODEL = "fal-ai/flux/dev"
 _API_KEY = "test-fal-key"
@@ -253,12 +256,76 @@ async def test_missing_images_in_response_is_infra(fal_server) -> None:
     assert "images[0].url" in str(excinfo.value)
 
 
-async def test_yandex_art_stub_raises_config_error() -> None:
-    with pytest.raises(ImageGenerationError) as excinfo:
-        await YandexArtStub().generate(_PROMPT)
+async def test_wrapper_emits_provider_event_on_success(tmp_path: Path) -> None:
+    db = Database(tmp_path / "stats.db")
+    await db.initialize()
+    primary = StubGenerator(result=b"primary")
 
-    assert excinfo.value.kind == "config"
-    assert "not implemented" in str(excinfo.value)
+    await FallbackImageGenerator(primary, None, db=db).generate(_PROMPT)
+
+    event = await db.get_last_event("image_fal_ok")
+    assert event is not None and "provider=fal" in event["details"]
+
+
+async def test_wrapper_keeps_the_provider_event_without_fal(
+    tmp_path: Path,
+) -> None:
+    """Regression guard: an art-only wiring must keep emitting its
+    success event - the observer may not depend on fal being wired."""
+    db = Database(tmp_path / "stats.db")
+    await db.initialize()
+    art = StubGenerator(result=b"art")
+
+    generator = FallbackImageGenerator(
+        art, None, primary_name="yandex_art", db=db
+    )
+    await generator.generate(_PROMPT)
+
+    event = await db.get_last_event("image_art_used")
+    assert event is not None and "provider=yandex_art" in event["details"]
+    assert await db.get_last_event("image_fal_ok") is None
+
+
+async def test_wrapper_emits_art_event_and_alerts_on_config_failure(
+    tmp_path: Path,
+) -> None:
+    db = Database(tmp_path / "stats.db")
+    await db.initialize()
+    alerter = MockAlerter()
+    primary = StubGenerator(error=ImageGenerationError("config", "fal http 401"))
+    fallback = StubGenerator(result=b"reserve")
+
+    generator = FallbackImageGenerator(
+        primary, fallback, db=db, alerter=alerter
+    )
+    data = await generator.generate(_PROMPT)
+
+    assert data == b"reserve"
+    event = await db.get_last_event("image_art_used")
+    assert event is not None and "primary_kind=config" in event["details"]
+    assert len(alerter.alerts) == 1 and "fal" in alerter.alerts[0]
+    assert "401" in alerter.alerts[0]
+
+
+async def test_wrapper_dedups_config_alerts_per_provider_per_day(
+    tmp_path: Path,
+) -> None:
+    db = Database(tmp_path / "stats.db")
+    await db.initialize()
+    alerter = MockAlerter()
+    # one wrapper for the whole run, as the runtime wiring builds it: the
+    # daily dedup lives in the wrapper instance
+    generator = FallbackImageGenerator(
+        StubGenerator(error=ImageGenerationError("config", "fal http 401")),
+        StubGenerator(result=b"reserve"),
+        db=db,
+        alerter=alerter,
+    )
+
+    await generator.generate(_PROMPT)
+    await generator.generate(_PROMPT)
+
+    assert len(alerter.alerts) == 1
 
 
 async def test_fallback_not_called_when_primary_succeeds() -> None:
@@ -293,12 +360,15 @@ async def test_fallback_rescues_primary_failure() -> None:
     assert fallback.prompts == [_PROMPT]
 
 
-async def test_both_failures_propagate_fallback_error() -> None:
-    primary = StubGenerator(error=ImageGenerationError("infra", "primary down"))
-    fallback = StubGenerator(error=ImageGenerationError("config", "reserve 401"))
+async def test_both_failures_propagate_fallback_error_with_context() -> None:
+    primary = StubGenerator(error=ImageGenerationError("infra", "fal down"))
+    fallback = StubGenerator(error=ImageGenerationError("config", "art 401"))
 
     with pytest.raises(ImageGenerationError) as excinfo:
         await FallbackImageGenerator(primary, fallback).generate(_PROMPT)
 
+    # the fallback's kind classifies the outcome; the message keeps both
+    # failures so a both-broken incident is diagnosable from bot_stats
     assert excinfo.value.kind == "config"
-    assert str(excinfo.value) == "reserve 401"
+    assert "fal down" in str(excinfo.value)
+    assert "art 401" in str(excinfo.value)

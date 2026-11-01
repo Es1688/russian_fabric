@@ -93,20 +93,25 @@ uv run pytest                                    # тесты
    подключите платный **billing-аккаунт** (бесплатного tier нет), создайте
    API-ключ AI Studio → `LLM_API_KEY`, скопируйте `folder_id` каталога и
    соберите имя модели → `LLM_FALLBACK_MODEL`: `gpt://<folder_id>/yandexgpt-5-lite`.
-   Тот же ключ в будущем обслужит генерацию изображений YandexART.
+   Тот же ключ и folder_id обслуживают резервный провайдер картинок
+   YandexART (см. ниже).
 3. При включённых рубриках LLM-видов (generative, digest) обязательны **оба**
    ключа: отсутствие любого роняет запуск с fail-fast ошибкой — тихая работа
    с одним каналом ломает заявленную отказоустойчивость.
 
-### Изображения (fal.ai)
+### Изображения (fal.ai + YandexART)
 
 Рубрика со значением `image: generate` в `rubrics.yaml` генерирует картинку
-через fal.ai (модель `fal-ai/flux/dev`); при сбое генерации пост деградирует
-до текстового, слот не падает. Создайте API-ключ на
-[fal.ai](https://fal.ai) → `FAL_KEY`: он обязателен, если хотя бы одна
-включённая рубрика использует `image: generate` (иначе запуск падает с
-fail-fast ошибкой). Второй провайдер YandexART — зарезервированная заглушка:
-ключа пока не требует (ADR-003).
+через пару провайдеров с фиксированным приоритетом **fal → YandexART** (ADR-003):
+при сбое fal (включая отказ socks-прокси) картинку генерирует Яндекс, при
+сбое обоих пост деградирует до текстового, слот не падает. fal (модель
+`fal-ai/flux/dev`) активен при `FAL_KEY` — создайте API-ключ на
+[fal.ai](https://fal.ai). YandexART отдельного ключа не имеет: он активен,
+когда задан `LLM_API_KEY`, а `LLM_FALLBACK_MODEL` содержит реальный
+`folder_id` (модель по умолчанию `aliceai-image-art-3.0`, опционально
+переопределяется ключом `yandex_art.model` в yaml). Рубрика с
+`image: generate` требует хотя бы один из двух провайдеров — иначе запуск
+падает с fail-fast ошибкой.
 
 ## Переменные окружения
 
@@ -120,12 +125,12 @@ fail-fast ошибкой). Второй провайдер YandexART — зар�
 | `LOG_LEVEL` | уровень логирования (`INFO`) |
 | `DATABASE_PATH` | путь к SQLite (в Docker: `/app/data/max_news_bot.db`) |
 | `OPENROUTER_API_KEY` | ключ OpenRouter — **первичный** LLM-канал |
-| `LLM_API_KEY` | ключ Yandex AI Studio — **резервный** LLM-канал (Yandex GPT); тот же ключ обслужит YandexART |
+| `LLM_API_KEY` | ключ Yandex AI Studio — **резервный** LLM-канал (Yandex GPT) и **резервный** провайдер картинок YandexART |
 | `LLM_BASE_URL` | переопределение базы URL первичного канала (дефолт `https://openrouter.ai/api/v1`) |
 | `LLM_MODEL` | переопределение модели первичного канала (дефолт `qwen/qwen3.8-flash`) |
 | `LLM_FALLBACK_BASE_URL` | база URL резервного канала (дефолт `https://ai.api.cloud.yandex.net/v1`) |
-| `LLM_FALLBACK_MODEL` | модель резервного канала: `gpt://<folder_id>/yandexgpt-5-lite` |
-| `FAL_KEY` | ключ fal.ai — генерация картинок для рубрик с `image: generate`; обязателен при таких рубриках |
+| `LLM_FALLBACK_MODEL` | модель резервного канала: `gpt://<folder_id>/yandexgpt-5-lite`; реальный `folder_id` также вооружает YandexART |
+| `FAL_KEY` | ключ fal.ai — **первичный** провайдер картинок для рубрик с `image: generate`; нужен хотя бы один провайдер (FAL_KEY или LLM_API_KEY+folder_id) |
 | `EGRESS_PROXY_URL` | socks5h-прокси (строго `socks5h://host:port`) для иностранных API — OpenRouter и fal.ai; пусто (дефолт) = всё напрямую. На VPS — локальный вход stelthVPN `socks5h://127.0.0.1:1080` (порт = `STELTHVPN_RU_BOT_SOCKS_PORT`), требует `network_mode: host` в compose (ADR-005) |
 | `RUBRICS_DRY_RUN` | dry-run контура (дефолт `true`): посты уходят админам из `ADMIN_IDS`, а не в канал; при `true` `ADMIN_IDS` обязателен |
 | `RUBRICS_CONFIG_PATH` | путь к yaml рубрик (дефолт `max_news_bot/config/rubrics.yaml`; файл обязателен) |
