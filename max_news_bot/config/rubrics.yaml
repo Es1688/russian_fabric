@@ -28,9 +28,8 @@ llm:
   temperature: 0.7
 llm_fallback:
   base_url: "https://ai.api.cloud.yandex.net/v1"
-  # Модель — полный URI gpt://<folder_id>/<model>. FOLDER_ID — заглушка:
-  # заменить на реальный id каталога Yandex Cloud.
-  model: "gpt://FOLDER_ID/yandexgpt-5-lite"
+  # Модель — полный URI gpt://<folder_id>/<model>.
+  model: "gpt://b1gtocq1pcbtginn0k60/deepseek-v4-flash/latest"
   disable_reasoning: false
 
 persona: |
